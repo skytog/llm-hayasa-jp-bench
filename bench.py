@@ -130,6 +130,7 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     ttft_any = None
     ttft_answer = None
     chunk_times = []
+    content_times = []
     content_parts = []
     reasoning_parts = []
     usage = {}
@@ -176,6 +177,7 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
                             chunk_times.append(now)
                             if piece:
                                 content_parts.append(piece)
+                                content_times.append(now)
                             if think:
                                 reasoning_parts.append(think)
                 if state == "timeout":
@@ -199,6 +201,9 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     usage_available = isinstance(completion, int) and isinstance(prompt_tokens, int)
     itls = [b - a for a, b in zip(chunk_times, chunk_times[1:])]
     span = (chunk_times[-1] - chunk_times[0]) if len(chunk_times) > 1 else None
+    # content 区間だけの速度（reasoning の時間を含めない = 純粋な日本語生成の速さ）
+    content_span = (content_times[-1] - content_times[0]) if len(content_times) > 1 else None
+    content_cps = (len(content) / content_span) if (content_span and len(content)) else None
     R_out = ((completion - 1) / span) if (span and usage_available and completion > 1) else None
 
     if state == "ok":
@@ -215,6 +220,8 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
         "ttft_any": ttft_any,
         "ttft_answer": ttft_answer,
         "l": chunk_times[-1] if chunk_times else None,
+        "content_span": content_span,
+        "content_chars_per_s": round(content_cps, 2) if content_cps else None,
         "total": total,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion,
@@ -339,16 +346,26 @@ def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
 
 DECODE_PROMPT = "1から200までの整数を1行に1つずつ、何も付け加えずに出力してください。"
 DECODE_TOKENS = 256
+# 日本語の散文 decode を測るための probe（ASCII の数字列では日本語負荷が見えない）
+DECODE_PROSE_PROMPT = (
+    "「地方の中小企業が業務システムをクラウドへ移行する際の注意点」について、"
+    "日本語で400文字以上600文字以内の説明文を書いてください。"
+    "段落は3つに分け、箇条書きは使わないでください。"
+    "前置きは書かず、本文だけを出力してください。"
+)
+DECODE_PROSE_TOKENS = 4096
 
 
-def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
+def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0, style="prose"):
     """decode probe を reps 回実行し、有効試行の中央値で返す。
 
     失敗試行も runs に残す（無申告の再送・棄却をしない）。
     """
+    prompt = DECODE_PROSE_PROMPT if style == "prose" else DECODE_PROMPT
+    max_tok = DECODE_PROSE_TOKENS if style == "prose" else DECODE_TOKENS
     runs = []
     for k in range(reps):
-        r = chat_stream(base, model, DECODE_PROMPT, max_tokens=DECODE_TOKENS, temperature=temperature)
+        r = chat_stream(base, model, prompt, max_tokens=max_tok, temperature=temperature)
         itls = r["itls"]
         valid = (r["state"] in ("ok", "empty", "truncated") and r["usage_available"]
                  and r["R_out"] is not None)
@@ -365,6 +382,12 @@ def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
             "ttft_any": r["ttft_any"],
             "ttft_answer": r["ttft_answer"],
             "completion_tokens": r["completion_tokens"],
+            "content_chars": r["content_chars"],
+            "chars_per_s": round(r["content_chars"] / r["l"], 2)
+            if (r["content_chars"] and r["l"]) else None,
+            "content_chars_per_s": r["content_chars_per_s"],
+            "chars_per_token": round(r["content_chars"] / r["completion_tokens"], 3)
+            if (r["content_chars"] and r["completion_tokens"]) else None,
             "itl_samples": len(itls),
         })
         if k < reps - 1:
@@ -379,7 +402,12 @@ def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
     if not valid_runs:
         raise RuntimeError(f"decode probe: 有効な試行なし (states={[x['state'] for x in runs]})")
     return {
+        "style": style,
         "R_out_tok_per_s": round(med("R_out"), 1) if med("R_out") else None,
+        "chars_per_s": med("chars_per_s"),
+        "content_chars_per_s": med("content_chars_per_s"),
+        "chars_per_token": med("chars_per_token"),
+        "content_chars": med("content_chars"),
         "p50_inter_chunk_gap_ms": med("gap_p50_ms"),
         "p90_inter_chunk_gap_ms": med("gap_p90_ms"),
         "tokens_per_chunk": med("tokens_per_chunk"),
@@ -445,6 +473,9 @@ def run_tasks(base, model, task_ids, runs, temperature, save_full=True):
                 "reasoning_chars": r["reasoning_chars"],
                 "content_chars": r["content_chars"],
                 "reasoning_repeat_ratio": r["reasoning_repeat_ratio"],
+                "chars_per_s": round(r["content_chars"] / r["l"], 2)
+                if (r["content_chars"] and r["l"]) else None,
+                "content_chars_per_s": r["content_chars_per_s"],
                 "l": round(r["l"], 3) if r["l"] else None,
                 "done_seen": r["done_seen"],
                 "parse_errors": r["parse_errors"],
@@ -498,6 +529,10 @@ def summarize(model, speed, task_results):
     ci = wilson_ci(passes, total_runs)
     task_all_pass = sum(1 for p in per_task if p["rate"] == 1.0)
     task_ci = wilson_ci(task_all_pass, len(per_task))
+    ccps = [r["content_chars_per_s"] for r in task_results
+            if r.get("content_chars_per_s") and r.get("state") in ("pass", "wrong_answer")]
+    cps = [r["chars_per_s"] for r in task_results
+           if r.get("chars_per_s") and r.get("state") in ("pass", "wrong_answer")]
     repeats = [r["reasoning_repeat_ratio"] for r in task_results
                if r.get("reasoning_repeat_ratio") is not None]
     return {
@@ -518,6 +553,8 @@ def summarize(model, speed, task_results):
             "mean_task_time_s": round(mean_time, 2) if mean_time else None,
             "time_to_pass_s": round(ttp, 2) if ttp else None,
             "mean_reasoning_repeat": round(statistics.mean(repeats), 3) if repeats else None,
+            "mean_chars_per_s": round(statistics.mean(cps), 2) if cps else None,
+            "mean_content_chars_per_s": round(statistics.mean(ccps), 2) if ccps else None,
             "states": states,
         },
     }
@@ -539,7 +576,12 @@ def markdown(results):
                   "| 指標 | 値 |", "|---|---|",
                   f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s (傾き法, R²={fmt(s.get('r2'), 3)}, n={s.get('probe_reps', '-')}中央値) |",
                   f"| 日本語トークン効率 | {fmt(s.get('tokens_per_char'), 3)} tok/文字（入力。1文字1トークン超は日本語の割高） |",
-                  f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms, n={s.get('probe_reps', '-')}中央値) |",
+                  f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s"
+                  + (f" / 実効 {fmt(s.get('decode_chars_per_s'), 1)} 文字/s・本文のみ "
+                     f"{fmt(s.get('decode_content_chars_per_s'), 1)} 文字/s（{s.get('decode_style')}、"
+                     f"{fmt(s.get('decode_chars_per_token'), 2)} 文字/token）"
+                     if s.get("decode_chars_per_s") else "")
+                  + f" (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms, n={s.get('probe_reps', '-')}中央値) |",
                   f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (全試行平均, {sm['task_runs']}回) |",
                   f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']})"
                   + (f" / 正常応答内 {sm['quality_rate'] * 100:.0f}%" if sm.get("quality_rate") is not None else "")
@@ -554,6 +596,12 @@ def markdown(results):
             lines.append(
                 f"- 成功率の Wilson 95%CI: {sm['success_rate_ci95'][0] * 100:.0f}–{sm['success_rate_ci95'][1] * 100:.0f}%"
                 "（naive iid。反復はクラスタ内反復なので過小評価）")
+        if sm.get("mean_chars_per_s") is not None:
+            lines.append(f"- 日本語出力速度（本文の文字/s、reasoning込みの実効）: "
+                         f"{fmt(sm['mean_chars_per_s'], 1)} 文字/s")
+            if sm.get("mean_content_chars_per_s") is not None:
+                lines.append(f"- 日本語生成速度（本文区間のみ）: "
+                             f"{fmt(sm['mean_content_chars_per_s'], 1)} 文字/s")
         if sm.get("mean_reasoning_repeat") is not None:
             lines.append(f"- reasoning 行重複率（平均）: {sm['mean_reasoning_repeat']:.2f}（高いほど反復・degeneration）")
         if sm.get("states"):
@@ -681,6 +729,8 @@ def main():
                     help="prefill/decode probe の反復回数（中央値を採用）")
     ap.add_argument("--probe-gap", type=float, default=2.0,
                     help="probe 反復間の idle 秒")
+    ap.add_argument("--decode-style", default="prose", choices=["prose", "numbers"],
+                    help="decode probe の出力形式（prose=日本語400-600字 / numbers=数字列）")
     ap.add_argument("--no-full-text", action="store_true",
                     help="生ログの回答全文・reasoning 全文を保存しない（既定は保存）")
     args = ap.parse_args()
@@ -720,7 +770,7 @@ def main():
             print(f"    prefill: {fmt(pre['prefill_tps'], 0)} tok/s (R2={fmt(pre['r2'], 3)})", flush=True)
             print("  decode probe...", flush=True)
             dec = measure_decode(args.base_url, model, args.temperature,
-                                  args.probe_reps, args.probe_gap)
+                                  args.probe_reps, args.probe_gap, style=args.decode_style)
             print(f"    R_out: {fmt(dec['R_out_tok_per_s'], 1)} tok/s "
                   f"(inter-chunk gap p50 {fmt(dec['p50_inter_chunk_gap_ms'], 1)} ms, "
                   f"{fmt(dec['tokens_per_chunk'], 2)} tok/chunk)", flush=True)
@@ -732,6 +782,10 @@ def main():
                      "tokens_per_char": pre["mean_tokens_per_char"],
                      "probe_reps": dec["probe_reps"],
                      "decode_tps": dec["R_out_tok_per_s"],
+                     "decode_style": dec.get("style"),
+                     "decode_chars_per_s": dec.get("chars_per_s"),
+                     "decode_content_chars_per_s": dec.get("content_chars_per_s"),
+                     "decode_chars_per_token": dec.get("chars_per_token"),
                      "p50_itl_ms": dec["p50_inter_chunk_gap_ms"],
                      "p90_itl_ms": dec["p90_inter_chunk_gap_ms"],
                      "tokens_per_chunk": dec["tokens_per_chunk"],

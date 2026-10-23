@@ -227,3 +227,18 @@ NFC 正規化の有無、改行・空白・数字・記号を数えるかを仕�
 - 全成功データの単純 bootstrap は幅0になり得る。「真の成功率100%」の根拠にしない
 - モデル間比較は対応を保つ（同一入力への成否は McNemar、時間は対応差/比 + CI）。多重比較は Holm
 - 非有意は同等性の証明ではない
+
+
+## 9. 日本語散文の decode（`--decode-style prose`）
+
+数字列（ASCII）の出力では日本語の生成負荷が見えない。そこで 400-600字の日本語散文を出力させ、
+次の2つを分けて記録する。
+
+- **本文区間のみの文字/s** = `content_chars / (最後のcontent delta - 最初のcontent delta)`
+  - reasoning を含めない、純粋な日本語生成の速さ
+- **実効文字/s** = `content_chars / (最後のdelta - 最初のdelta)`
+  - reasoning の時間を含む。ユーザーが本文を受け取るまでの実効速度
+
+両者の比が **reasoning の相対コスト**になる（実測では reasoning が本文の 8〜20 倍の長さになり、
+実効速度が本文区間の 1/8 程度まで落ちる）。`completion_tokens` は reasoning と本文の合計なので、
+`content_chars / completion_tokens` を「日本語の文字/token」と読むのは誤り（reasoning で希釈される）。

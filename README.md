@@ -11,10 +11,11 @@ GPU・並列化・sampling・ネットワークの全体）。同じモデル名
 | 指標 | 意味 | 実装 | 主張の限界 |
 |---|---|---|---|
 | **Prefill** | 入力長あたりの TTFT 傾きの逆数 (tok/s) | プロンプト長を複数段階変え、`TTFT = a + b × prompt_tokens` を最小二乗フィット。`1/b` を採用 | サーバー内部の純粋な prefill ではない。ネットワーク・scheduler・buffering を含む。切片 `a` は外挿値で、内訳（往復/キュー待ち/固定費）は同定できない |
-| **Decode** | クライアント観測出力レート `R_out` (tok/s) | `(completion_tokens - 1) / (最後の非空delta - 最初の非空delta)` | token 単位の ITL ではない。SSE チャンクには複数トークンが入る（実測 5.1 tok/chunk）。`inter-chunk gap` は別物として併記 |
+| **Decode** | クライアント観測出力レート `R_out` (tok/s) と **日本語本文の文字/s** | `(completion_tokens - 1) / (最後の非空delta - 最初の非空delta)`。`--decode-style prose` では 400-600字の日本語散文を出力させ、**本文区間だけ**の文字/s も測る | token 単位の ITL ではない。SSE チャンクには複数トークンが入る（実測 3.6 tok/chunk）。`inter-chunk gap` は別物として併記。**reasoning 込みの実効文字/s** と **本文区間のみの文字/s** は別物 |
 | **Task completion time** | リクエスト開始から**終結**（成功・失敗・打切り）までの時間 | 固定タスクを N 回実行し、全試行の時間を平均 | 「成功したタスクの平均時間」ではない。成否は隣に並べて読む |
 
-補助指標: タスク成功率（PASS/FAIL、**日本語能力の保証ではない**）、TTP（観測時間あたりの成功）、
+補助指標: **日本語本文の文字/s**（reasoning を除いた生成速度）、**実効文字/s**（reasoning 込みでタスクが終わるまで）、
+タスク成功率（PASS/FAIL、**日本語能力の保証ではない**）、TTP（観測時間あたりの成功）、
 日本語トークン効率（入力 `prompt_tokens / 文字数`。日本語は英語より同じ文字数で約3倍のトークンを食う）。
 
 **指標の定義・仮定・観測契約は `specs/` が上位**（実装は仕様に追従する）:
@@ -90,10 +91,11 @@ python3 steady.py --model X --mode open --rate 0.1,0.2,0.3 --duration 60
 - `--temperature`（既定 0.0）
 - `--prefill-lengths`（既定 `500,2000,8000` 文字）
 - `--probe-reps`（既定 3、中央値）/ `--probe-gap`（既定 2s）
+- `--decode-style prose|numbers`（既定 prose。prose は日本語400-600字を出力させ、本文区間の文字/s を測る）
 - `--no-warmup` / `--no-speed` / `--no-full-text`
 - `--cache-mode off|on|unknown` / `--scenario S1|S2|S3` / `--out`
 
-## タスク一覧（14本）
+## タスク一覧（18本）
 
 | id | 種類 | 判定 |
 |---|---|---|
@@ -111,6 +113,10 @@ python3 steady.py --model X --mode open --rate 0.1,0.2,0.3 --duration 60
 | `reconcile_invoices` | 複数文書突合（難） | 請求総額・入金総額・未入金残高（int exact） |
 | `table_extract_filter` | 表抽出（難） | プラス部署のみ、売上降順、要素は object |
 | `business_days` | 日付計算（難） | 2026年4月の営業日数（最終行の整数） |
+| `prose_explain` | 散文 400-600字 | 文字数・3段落・必須語2つ・箇条書き/見出し禁止（**意味品質は見ない**） |
+| `prose_procedure` | 散文 手順書 | 1.〜5. の番号順・各40字以上・全体500字以上・記号箇条書き禁止 |
+| `prose_email` | 散文 メール | 件名行・宛名・300-500字・必須語2つ・箇条書き禁止 |
+| `prose_longform` | 散文 1000-1400字 | 文字数・5段落・各段落3文以上・必須語2つ |
 
 状態分類: `pass` / `wrong_answer` / `format_violation` / `budget_exhausted` / `empty` /
 `truncated` / `http_error` / `timeout` / `grader_error`。`grader_error` が出た run は `degraded`。

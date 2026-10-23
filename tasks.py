@@ -1059,6 +1059,184 @@ def grade_business_days(text, meta):
     return (got == exp), (f"got {got} (expected {exp})" if got != exp else "ok")
 
 
+
+# --- 15. 散文: 説明文（400-600字・3段落）
+def _prose_body(text: str) -> str:
+    return _strip_fences(text).strip()
+
+
+def _prose_chars(body: str) -> int:
+    return len(re.sub(r"\s", "", body))
+
+
+def _prose_paras(body: str) -> list:
+    return [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+
+
+def _prose_bullets(body: str) -> list:
+    return [ln for ln in body.splitlines()
+            if re.match(r"^\s*([-*・●○◆]|\d+[.)．、])\s+", ln)]
+
+
+def _prose_headings(body: str) -> list:
+    return [ln for ln in body.splitlines()
+            if re.match(r"^\s*(#{1,6}\s|■|【)", ln)]
+
+
+T_PROSE_EXPLAIN = {
+    "id": "prose_explain",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語の説明文を書いてください。
+
+テーマ: 地方の中小企業が業務システムをクラウドへ移行する際の注意点
+
+条件:
+- 400文字以上600文字以内（空白・改行を除いて数える）
+- 3段落に分ける（段落の間は空行を1行入れる）
+- 「クラウド」と「コスト」をそれぞれ1回以上含める
+- 箇条書き・見出し・コードブロックは使わない
+- 前置きや説明は書かず、本文だけを出力する""",
+}
+
+
+def grade_prose_explain(text, meta):
+    body = _prose_body(text)
+    n = _prose_chars(body)
+    paras = _prose_paras(body)
+    bad = []
+    if not (400 <= n <= 600):
+        bad.append(f"{n}文字（400-600が必要）")
+    if len(paras) != 3:
+        bad.append(f"段落{len(paras)}（3が必要）")
+    for w in ("クラウド", "コスト"):
+        if w not in body:
+            bad.append(f"「{w}」無し")
+    if _prose_bullets(body):
+        bad.append("箇条書きあり")
+    if _prose_headings(body):
+        bad.append("見出しあり")
+    if "```" in text:
+        bad.append("コードブロックあり")
+    return (not bad), ("ok" if not bad else "; ".join(bad))
+
+
+# --- 16. 散文: 手順書（5ステップ）
+T_PROSE_PROCEDURE = {
+    "id": "prose_procedure",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語の手順書を書いてください。
+
+テーマ: 社内問い合わせへの一次対応手順
+
+条件:
+- 5つのステップを「1.」から「5.」まで番号付きで、この順に書く
+- 各ステップは40文字以上（空白・改行を除いて数える）
+- 全体で500文字以上
+- 番号以外の箇条書き記号（-、・、*）は使わない
+- 前置きや説明は書かず、手順だけを出力する""",
+}
+
+
+def grade_prose_procedure(text, meta):
+    body = _prose_body(text)
+    steps = []
+    for ln in body.splitlines():
+        m = re.match(r"^\s*(\d+)[.)．、]\s*(.+)$", ln)
+        if m:
+            steps.append((int(m.group(1)), m.group(2).strip()))
+    bad = []
+    if [n for n, _ in steps] != [1, 2, 3, 4, 5]:
+        bad.append(f"番号列={[n for n, _ in steps]}（1..5が必要）")
+    short = [n for n, t in steps if _prose_chars(t) < 40]
+    if short:
+        bad.append(f"40文字未満のステップ={short}")
+    total = _prose_chars(body)
+    if total < 500:
+        bad.append(f"{total}文字（500以上が必要）")
+    if [ln for ln in body.splitlines() if re.match(r"^\s*[-*・●○◆]\s+", ln)]:
+        bad.append("番号以外の箇条書き記号あり")
+    return (not bad), ("ok" if not bad else "; ".join(bad))
+
+
+# --- 17. 散文: ビジネスメール
+T_PROSE_EMAIL = {
+    "id": "prose_email",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語のビジネスメールを書いてください。
+
+状況: 取引先（山田製作所 佐藤様）に、部品の納期延期を依頼する
+
+条件:
+- 1行目に「件名: 」で始まる件名を書く
+- 宛名の行に「佐藤様」を含める
+- 全体で300文字以上500文字以内（空白・改行を除いて数える）
+- 「納期」と「確認」をそれぞれ1回以上含める
+- 箇条書きは使わない
+- 前置きや説明は書かず、メール本文だけを出力する""",
+}
+
+
+def grade_prose_email(text, meta):
+    body = _prose_body(text)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    bad = []
+    if not lines or not lines[0].startswith("件名"):
+        bad.append("1行目が件名でない")
+    if "佐藤様" not in body:
+        bad.append("宛名（佐藤様）無し")
+    n = _prose_chars(body)
+    if not (300 <= n <= 500):
+        bad.append(f"{n}文字（300-500が必要）")
+    for w in ("納期", "確認"):
+        if w not in body:
+            bad.append(f"「{w}」無し")
+    if _prose_bullets(body):
+        bad.append("箇条書きあり")
+    return (not bad), ("ok" if not bad else "; ".join(bad))
+
+
+# --- 18. 散文: 長文（1000-1400字・5段落）
+T_PROSE_LONGFORM = {
+    "id": "prose_longform",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語の文章を書いてください。
+
+テーマ: 製造業におけるDX推進の課題と打ち手
+
+条件:
+- 1000文字以上1400文字以内（空白・改行を除いて数える）
+- 5段落に分ける（段落の間は空行を1行入れる）
+- 各段落は3文以上（「。」で区切って数える）
+- 「現場」と「データ」をそれぞれ1回以上含める
+- 箇条書き・見出しは使わない
+- 前置きや説明は書かず、本文だけを出力する""",
+}
+
+
+def grade_prose_longform(text, meta):
+    body = _prose_body(text)
+    n = _prose_chars(body)
+    paras = _prose_paras(body)
+    bad = []
+    if not (1000 <= n <= 1400):
+        bad.append(f"{n}文字（1000-1400が必要）")
+    if len(paras) != 5:
+        bad.append(f"段落{len(paras)}（5が必要）")
+    short = [i + 1 for i, p in enumerate(paras) if p.count("。") < 3]
+    if short:
+        bad.append(f"3文未満の段落={short}")
+    for w in ("現場", "データ"):
+        if w not in body:
+            bad.append(f"「{w}」無し")
+    if _prose_bullets(body) or _prose_headings(body):
+        bad.append("箇条書き/見出しあり")
+    return (not bad), ("ok" if not bad else "; ".join(bad))
+
+
 TASKS = [
     dict(T_CODE_WORDS, grader=grade_code_words),
     dict(T_CODE_YEN, grader=grade_yen),
@@ -1074,6 +1252,10 @@ TASKS = [
     dict(T_RECONCILE, grader=grade_reconcile),
     dict(T_TABLE, grader=grade_table),
     dict(T_BUSINESS_DAYS, grader=grade_business_days),
+    dict(T_PROSE_EXPLAIN, grader=grade_prose_explain),
+    dict(T_PROSE_PROCEDURE, grader=grade_prose_procedure),
+    dict(T_PROSE_EMAIL, grader=grade_prose_email),
+    dict(T_PROSE_LONGFORM, grader=grade_prose_longform),
 ]
 
 TASK_BY_ID = {t["id"]: t for t in TASKS}
