@@ -269,7 +269,8 @@ def measure_prefill(base, model, lengths, temperature=0.0):
         else:
             raise RuntimeError(f"prefill probe failed ({chars} chars): {r['error']}")
         samples.append({"chars": chars, "prompt_tokens": r["prompt_tokens"],
-                        "ttft": round(r["ttft"], 4)})
+                        "ttft": round(r["ttft"], 4),
+                        "tokens_per_char": round(r["prompt_tokens"] / chars, 3)})
         time.sleep(0.3)
 
     xs = [s["prompt_tokens"] for s in samples]
@@ -290,6 +291,8 @@ def measure_prefill(base, model, lengths, temperature=0.0):
         "intercept_s": a,
         "r2": r2,
         "samples": samples,
+        "mean_tokens_per_char": round(
+            sum(s["tokens_per_char"] for s in samples) / len(samples), 3),
         "note": "TTFTの傾き法。切片=ネットワーク+キュー待ち+固定オーバーヘッド",
     }
 
@@ -454,6 +457,7 @@ def markdown(results):
         lines += [f"## {res['model']}", "",
                   "| 指標 | 値 |", "|---|---|",
                   f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s (傾き法, R²={fmt(s.get('r2'), 3)}) |",
+                  f"| 日本語トークン効率 | {fmt(s.get('tokens_per_char'), 3)} tok/文字（入力。1文字1トークン超は日本語の割高） |",
                   f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms) |",
                   f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (全試行平均, {sm['task_runs']}回) |",
                   f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']})"
@@ -624,6 +628,7 @@ def main():
                      "intercept_s": pre["intercept_s"],
                      "r2": pre["r2"],
                      "prefill_samples": pre["samples"],
+                     "tokens_per_char": pre["mean_tokens_per_char"],
                      "decode_tps": dec["R_out_tok_per_s"],
                      "p50_itl_ms": dec["p50_inter_chunk_gap_ms"],
                      "p90_itl_ms": dec["p90_inter_chunk_gap_ms"],
