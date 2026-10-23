@@ -46,7 +46,17 @@ def _extract_json(text: str) -> dict | None:
         # Python の json は既定で NaN / Infinity を受理するため明示的に拒否する
         def _reject(x):
             raise ValueError(f"non-finite constant: {x}")
-        return json.loads(body[i:j + 1], parse_constant=_reject)
+
+        def _no_dup(pairs):
+            seen, out = set(), {}
+            for k, v in pairs:
+                if k in seen:
+                    raise ValueError(f"duplicate key: {k}")
+                seen.add(k)
+                out[k] = v
+            return out
+
+        return json.loads(body[i:j + 1], parse_constant=_reject, object_pairs_hook=_no_dup)
     except Exception:
         return None
 
@@ -151,6 +161,374 @@ def _run_code(code: str, tests: str, timeout: int = 60) -> tuple[bool, str]:
 
 # ---------------------------------------------------------------- tasks
 
+
+# ---------------------------------------------------------------------------
+# コード採点: 親が期待値を持ち、候補は入力だけを受け取る（nonce 偽装の根治）
+# ---------------------------------------------------------------------------
+
+
+class GraderUnavailable(RuntimeError):
+    """隔離実行が使えない（モデルの失敗ではなく測定不能）。"""
+
+
+ALLOW_NO_SANDBOX = os.environ.get("LLM_BENCH_ALLOW_NO_SANDBOX") == "1"
+
+
+def _run_cases(code: str, cases: list[dict], timeout: int = 120) -> list[dict]:
+    """候補コードを隔離環境で実行し、各ケースの戻り値だけを返す。
+
+    期待値は親プロセスにしか存在しない。候補は cases.json（入力）を読めるが、
+    正解を知らないので、正しく計算しない限り一致しない。
+    """
+    import shlex
+    import uuid
+
+    if not _docker_available() and not ALLOW_NO_SANDBOX:
+        raise GraderUnavailable("docker unavailable (fail-closed)")
+
+    token = uuid.uuid4().hex[:8]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        with open(os.path.join(d, "sol.py"), "w", encoding="utf-8") as f:
+            f.write(code + "\n")
+        with open(os.path.join(d, "cases.json"), "w", encoding="utf-8") as f:
+            json.dump(cases, f, ensure_ascii=False)
+        with open(os.path.join(d, "runner.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import json, sys\n"
+                "sys.path.insert(0, '/work')\n"
+                "import sol\n"
+                "cases = json.load(open('/work/cases.json'))\n"
+                "out = []\n"
+                "for c in cases:\n"
+                "    try:\n"
+                "        if 'class' in c:\n"
+                "            obj = getattr(sol, c['class'])(*c.get('init', []))\n"
+                "            res = []\n"
+                "            for op in c['ops']:\n"
+                "                res.append(getattr(obj, op[0])(*op[1:]))\n"
+                "            out.append({'ok': True, 'result': res})\n"
+                "        else:\n"
+                "            fn = getattr(sol, c['func'])\n"
+                "            args = c.get('args', [])\n"
+                "            res = fn(*args)\n"
+                "            rec = {'ok': True, 'result': res}\n"
+                "            if c.get('echo_args'):\n"
+                "                rec['args_after'] = args\n"
+                "            out.append(rec)\n"
+                "    except Exception as e:\n"
+                "        out.append({'ok': False, 'error': type(e).__name__ + ': ' + str(e)[:200]})\n"
+                "print('RESULT_JSON:' + json.dumps(out, ensure_ascii=False, default=str))\n"
+            )
+        os.chmod(d, 0o777)
+        if _docker_available():
+            name = f"llmbench-{token}"
+            cmd = [
+                "docker", "run", "--rm", "--name", name,
+                "--network", "none", "--read-only",
+                "--tmpfs", "/tmp:rw,size=8m",
+                "-v", f"{d}:/work:rw",
+                "--memory", "512m", "--memory-swap", "512m",
+                "--pids-limit", "128", "--cpus", "1",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "-w", "/work",
+                "python:3.12-slim", "python", "-I", "-B", "/work/runner.py",
+            ]
+            try:
+                r = subprocess.run(["sg", "docker", "-c", shlex.join(cmd)],
+                                   capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["sg", "docker", "-c", f"docker rm -f {name}"],
+                               capture_output=True, timeout=20)
+                return [{"ok": False, "error": "timeout"} for _ in cases]
+        else:
+            env = {"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"}
+            try:
+                r = subprocess.run([sys.executable, "-I", "-B", os.path.join(d, "runner.py")],
+                                   capture_output=True, text=True, timeout=timeout, cwd=d, env=env)
+            except subprocess.TimeoutExpired:
+                return [{"ok": False, "error": "timeout"} for _ in cases]
+
+        line = None
+        for ln in reversed(r.stdout.splitlines()):
+            if ln.startswith("RESULT_JSON:"):
+                line = ln[len("RESULT_JSON:"):]
+                break
+        if line is None:
+            err = (r.stderr or "")
+            infra = ("docker:", "permission denied", "cannot connect", "no such image",
+                     "unable to find image", "pull access denied")
+            if any(m in err.lower() for m in infra):
+                raise GraderUnavailable(f"container failure: {err.strip()[:300]}")
+            # 候補が RESULT_JSON を出さずに終了（os._exit 等）→ 候補の失敗
+            return [{"ok": False, "error": "no RESULT_JSON (candidate exited early)"}
+                    for _ in cases]
+        try:
+            parsed = json.loads(line)
+        except Exception as e:  # noqa: BLE001
+            raise GraderUnavailable(f"runner output unparsable: {e}") from e
+        if len(parsed) != len(cases):
+            raise GraderUnavailable(f"result count mismatch: {len(parsed)} != {len(cases)}")
+        return parsed
+
+
+def _check_cases(code: str, cases: list[dict], expected: list[dict]) -> tuple[bool, str]:
+    results = _run_cases(code, cases)
+    for c, res, exp in zip(cases, results, expected):
+        if "error" in exp:
+            if res.get("ok") or res.get("error", "").split(":")[0] != exp["error"]:
+                return False, f"case={c}: expected {exp['error']}, got {res}"
+            continue
+        if not res.get("ok"):
+            return False, f"case={c}: raised {res.get('error')}"
+        if res.get("result") != exp["value"]:
+            return False, f"case={c}: got {res.get('result')!r}, expected {exp['value']!r}"
+        if "args_after" in exp and res.get("args_after") != exp["args_after"]:
+            return False, f"case={c}: 入力が変更された {res.get('args_after')!r}"
+    return True, f"ok ({len(cases)} cases)"
+
+
+# --- 参照実装（親側の期待値計算） ---------------------------------------
+
+_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+           "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_KANJI_DIGIT = "零一二三四五六七八九"
+
+
+def _ref_count_words(text: str) -> int:
+    return len(text.split())
+
+
+def _ref_yen(s: str) -> int:
+    t = str(s).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    for ch in (",", "¥", "円", " ", "\u3000"):
+        t = t.replace(ch, "")
+    if not any(ch.isdigit() for ch in t):
+        raise ValueError("no digits")
+    return int(t)
+
+
+def _ref_lru(capacity: int, ops: list) -> list:
+    from collections import OrderedDict
+    d = OrderedDict()
+    out = []
+    for op in ops:
+        if op[0] == "put":
+            k, v = op[1], op[2]
+            d[k] = v
+            d.move_to_end(k)
+            if len(d) > capacity:
+                d.popitem(last=False)
+            out.append(None)
+        else:
+            k = op[1]
+            if k in d:
+                d.move_to_end(k)
+                out.append(d[k])
+            else:
+                out.append(-1)
+    return out
+
+
+def _ref_csv(text: str) -> list:
+    if text == "":
+        return []
+    rows, row, field = [], [], []
+    in_q = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_q:
+            if ch == '"':
+                if i + 1 < n and text[i + 1] == '"':
+                    field.append('"')
+                    i += 2
+                    continue
+                in_q = False
+                i += 1
+                continue
+            field.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_q = True
+            i += 1
+            continue
+        if ch == ",":
+            row.append("".join(field))
+            field = []
+            i += 1
+            continue
+        if ch == "\n":
+            row.append("".join(field))
+            field = []
+            rows.append(row)
+            row = []
+            i += 1
+            continue
+        field.append(ch)
+        i += 1
+    row.append("".join(field))
+    rows.append(row)
+    if text.endswith("\n") and rows and rows[-1] == [""]:
+        rows.pop()
+    return rows
+
+
+def _ref_merge(intervals: list) -> list:
+    if not intervals:
+        return []
+    s = sorted([list(x) for x in intervals])
+    out = []
+    for a, b in s:
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _ref_kanji(s: str) -> int:
+    if not s:
+        raise ValueError("empty")
+    total = section = number = 0
+    for ch in s:
+        if ch in _DIGITS:
+            number = _DIGITS[ch]
+        elif ch == "十":
+            section += (number or 1) * 10
+            number = 0
+        elif ch == "百":
+            section += (number or 1) * 100
+            number = 0
+        elif ch == "千":
+            section += (number or 1) * 1000
+            number = 0
+        elif ch == "万":
+            total += (section + number) * 10000
+            section = number = 0
+        elif ch == "億":
+            total += (section + number) * 100000000
+            section = number = 0
+        else:
+            raise ValueError(f"unexpected char: {ch}")
+    return total + section + number
+
+
+def _kanji_format(n: int) -> str:
+    if n == 0:
+        return "零"
+    out = ""
+    for val, unit in ((10 ** 8, "億"), (10 ** 4, "万")):
+        d, n = divmod(n, val)
+        if d:
+            out += _kanji_format(d) + unit
+    for val, unit in ((1000, "千"), (100, "百"), (10, "十"), (1, "")):
+        d, n = divmod(n, val)
+        if d:
+            out += ("" if (d == 1 and unit) else _KANJI_DIGIT[d]) + unit
+    return out
+
+
+def _code_cases(kind: str, rng) -> tuple[list, list]:
+    """ランダムなケースと親側の期待値を生成する。"""
+    cases, expected = [], []
+    if kind == "count_words":
+        pieces = ["a", "b", "日本語", "x1", "カタカナ"]
+        seps = [" ", "  ", "\t", "\n", "\u3000", " \t "]
+        for _ in range(8):
+            k = rng.randint(1, 5)
+            body = "".join(rng.choice(pieces) + (rng.choice(seps) if i < k - 1 else "")
+                           for i in range(k))
+            body = rng.choice(["", " "]) + body + rng.choice(["", "\u3000", "\n"])
+            cases.append({"func": "count_words", "args": [body]})
+            expected.append({"value": _ref_count_words(body)})
+        for body in ["", "   ", "\u3000"]:
+            cases.append({"func": "count_words", "args": [body]})
+            expected.append({"value": _ref_count_words(body)})
+    elif kind == "yen":
+        for _ in range(8):
+            v = rng.randint(0, 9_999_999)
+            style = rng.choice(["comma", "yen", "zen", "plain", "space"])
+            if style == "comma":
+                s = f"{v:,}円"
+            elif style == "yen":
+                s = f"¥{v:,}"
+            elif style == "zen":
+                s = str(v).translate(str.maketrans("0123456789", "０１２３４５６７８９")) + "円"
+            elif style == "space":
+                s = f" {v:,} 円 "
+            else:
+                s = str(v)
+            cases.append({"func": "yen_to_int", "args": [s]})
+            expected.append({"value": _ref_yen(s)})
+        for bad in ["円", "¥", ""]:
+            cases.append({"func": "yen_to_int", "args": [bad]})
+            expected.append({"error": "ValueError"})
+    elif kind == "lru":
+        for _ in range(4):
+            cap = rng.randint(1, 3)
+            ops = []
+            for _ in range(rng.randint(8, 14)):
+                k = rng.randint(1, 5)
+                if rng.random() < 0.5:
+                    ops.append(["put", k, rng.randint(1, 99)])
+                else:
+                    ops.append(["get", k])
+            cases.append({"class": "LRUCache", "init": [cap], "ops": ops})
+            expected.append({"value": _ref_lru(cap, ops)})
+    elif kind == "csv":
+        pool = ['a', 'b', 'c', 'x,y', 'q"z', 'l1\nl2', ' sp ', '']
+        for _ in range(6):
+            rows = []
+            for _ in range(rng.randint(1, 3)):
+                rows.append([rng.choice(pool) for _ in range(rng.randint(1, 4))])
+            lines = []
+            for row in rows:
+                fields = []
+                for f in row:
+                    if any(ch in f for ch in [',', '"', '\n']):
+                        fields.append('"' + f.replace('"', '""') + '"')
+                    else:
+                        fields.append(f)
+                lines.append(",".join(fields))
+            text = "\n".join(lines) + rng.choice(["", "\n"])
+            cases.append({"func": "parse_csv", "args": [text]})
+            expected.append({"value": _ref_csv(text)})
+        for text in ["", "a\n\nb", " x , y "]:
+            cases.append({"func": "parse_csv", "args": [text]})
+            expected.append({"value": _ref_csv(text)})
+    elif kind == "merge":
+        for _ in range(6):
+            iv = []
+            for _ in range(rng.randint(0, 5)):
+                a = rng.randint(0, 20)
+                iv.append([a, a + rng.randint(0, 5)])
+            rng.shuffle(iv)
+            cases.append({"func": "merge_intervals", "args": [iv], "echo_args": True})
+            expected.append({"value": _ref_merge(iv), "args_after": [iv]})
+    elif kind == "kanji":
+        for _ in range(8):
+            n = rng.choice([rng.randint(0, 9), rng.randint(10, 99),
+                             rng.randint(100, 999), rng.randint(1000, 9999),
+                             rng.randint(10 ** 4, 10 ** 6), rng.randint(10 ** 6, 10 ** 8)])
+            s = _kanji_format(n)
+            cases.append({"func": "kanji_to_int", "args": [s]})
+            expected.append({"value": n})
+        for bad in ["abc", "十a"]:
+            cases.append({"func": "kanji_to_int", "args": [bad]})
+            expected.append({"error": "ValueError"})
+    return cases, expected
+
+
+def _grade_code_kind(text: str, kind: str, seed: int = 1234) -> tuple[bool, str]:
+    import random
+    code = _extract_python(text)
+    if not code.strip():
+        return False, "コードブロックが無い"
+    cases, expected = _code_cases(kind, random.Random(seed))
+    return _check_cases(code, cases, expected)
+
+
 # --- 1. コード: 単語数カウント
 T_CODE_WORDS = {
     "id": "code_count_words",
@@ -178,7 +556,7 @@ print("ALL_PASS")
 
 
 def grade_code_words(text, meta):
-    return _run_code(_extract_python(text), T_CODE_WORDS["tests"])
+    return _grade_code_kind(text, "count_words")
 
 
 # --- 2. コード: 金額パース
@@ -212,7 +590,7 @@ print("ALL_PASS")
 
 
 def grade_yen(text, meta):
-    return _run_code(_extract_python(text), T_CODE_YEN["tests"])
+    return _grade_code_kind(text, "yen")
 
 
 # --- 3. コード: LRU キャッシュ
@@ -252,7 +630,7 @@ print("ALL_PASS")
 
 
 def grade_lru(text, meta):
-    return _run_code(_extract_python(text), T_CODE_LRU["tests"])
+    return _grade_code_kind(text, "lru")
 
 
 # --- 4. 情報抽出: 社員情報
@@ -279,6 +657,8 @@ def grade_extract_emp(text, meta):
         return False, "invalid json"
     exp = T_EXTRACT_EMP["expected"]
     bad = []
+    if set(d.keys()) != {"氏名", "部署", "入社年", "年収"}:
+        bad.append(f"キー集合={sorted(d.keys())}")
     if _norm(d.get("氏名", "")) != exp["氏名"]:
         bad.append(f"氏名={d.get('氏名')!r}")
     if _norm(d.get("部署", "")) != exp["部署"]:
@@ -287,9 +667,8 @@ def grade_extract_emp(text, meta):
             and d["入社年"] == exp["入社年"]):
         bad.append(f"入社年={d.get('入社年')!r}")
     v = d.get("年収")
-    if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-            and float(v) == exp["年収"]):
-        bad.append(f"年収={v!r}")
+    if not (isinstance(v, int) and not isinstance(v, bool) and v == exp["年収"]):
+        bad.append(f"年収={v!r} (整数が必要)")
     return (not bad), ("ok" if not bad else "; ".join(bad))
 
 
@@ -316,14 +695,15 @@ def grade_numeric(text, meta):
     m = re.match(r"答え[:：]\s*([0-9０-９,]+)\s*(万|億)?\s*$", lines[-1])
     if not m:
         return False, f"最終行に答えが無い: {lines[-1][:80]!r}"
-    v = float(m.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789")).replace(",", ""))
+    raw = m.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    if "," in raw and not re.fullmatch(r"[0-9]{1,3}(,[0-9]{3})+", raw):
+        return False, f"不正な桁区切り: {raw}"
+    v = int(raw.replace(",", ""))
     if m.group(2) == "万":
-        v *= 1e4
+        v *= 10000
     elif m.group(2) == "億":
-        v *= 1e8
-    if abs(v - exp) <= 0.5:
-        return True, "ok"
-    return False, f"got {v:g} (expected {exp})"
+        v *= 100000000
+    return (v == exp), (f"got {v} (expected {exp})" if v != exp else "ok")
 
 
 # --- 6. 制約付き要約
@@ -350,8 +730,6 @@ def grade_summary(text, meta):
         problems.append("コスト無し")
     if len(body) > 60:
         problems.append(f"{len(body)}文字>60")
-    if len(body) < 10:
-        problems.append(f"短すぎ{len(body)}")
     return (not problems), ("ok" if not problems else f"{'; '.join(problems)} :: {body[:70]}")
 
 
@@ -470,7 +848,7 @@ print("ALL_PASS")
 
 
 def grade_csv(text, meta):
-    return _run_code(_extract_python(text), T_CODE_CSV["tests"])
+    return _grade_code_kind(text, "csv")
 
 
 # --- 10. コード: バグ修正（区間マージ）
@@ -518,7 +896,7 @@ print("ALL_PASS")
 
 
 def grade_bugfix(text, meta):
-    return _run_code(_extract_python(text), T_CODE_BUGFIX["tests"])
+    return _grade_code_kind(text, "merge")
 
 
 # --- 11. コード: 漢数字→整数
@@ -557,7 +935,7 @@ print("ALL_PASS")
 
 
 def grade_kanji(text, meta):
-    return _run_code(_extract_python(text), T_CODE_KANJI["tests"])
+    return _grade_code_kind(text, "kanji")
 
 
 # --- 12. 複数文書の突合

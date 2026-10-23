@@ -34,10 +34,14 @@ def pct(vals, p):
 
 def _safe_chat(base, model, temperature):
     try:
-        return chat_stream(base, model, PROMPT, MAX_TOKENS, temperature, 900)
+        r = chat_stream(base, model, PROMPT, MAX_TOKENS, temperature, 900)
+        return {"state": r["state"], "error": r.get("error"),
+                "completion_tokens": r["completion_tokens"],
+                "usage_available": r["usage_available"],
+                "ttft": r["ttft_any"], "total": r["total"], "R_out": r["R_out"]}
     except Exception as e:  # noqa: BLE001
-        return {"error": str(e)[:160], "completion_tokens": 0, "ttft": None,
-                "total": 0.0, "R_out": None, "itls": []}
+        return {"state": "error", "error": str(e)[:160], "completion_tokens": None,
+                "usage_available": False, "ttft": None, "total": 0.0, "R_out": None}
 
 
 def run_level(base, model, conc, temperature):
@@ -47,9 +51,12 @@ def run_level(base, model, conc, temperature):
         results = [f.result() for f in futures]
     wall = time.perf_counter() - t0
 
-    ok = [r for r in results if r["completion_tokens"]]
-    errors = [r for r in results if not r["completion_tokens"]]
-    total_tokens = sum(r["completion_tokens"] for r in ok)
+    ok_states = ("ok", "empty", "truncated")
+    ok = [r for r in results if r["state"] in ok_states]
+    errors = [r for r in results if r["state"] not in ok_states]
+    with_usage = [r for r in ok if r["usage_available"] and r["completion_tokens"]]
+    coverage = round(len(with_usage) / len(ok), 3) if ok else None
+    total_tokens = sum(r["completion_tokens"] for r in with_usage)
     ttfts = [r["ttft"] for r in ok if r["ttft"]]
     decodes = [r["R_out"] for r in ok if r.get("R_out")]
     totals = [r["total"] for r in ok]
@@ -61,6 +68,7 @@ def run_level(base, model, conc, temperature):
         "wall_s": round(wall, 3),
         "total_completion_tokens": total_tokens,
         "agg_tps": round(total_tokens / wall, 1) if wall > 0 else None,
+        "token_coverage": coverage,
         "per_stream_decode_p50": round(statistics.median(decodes), 1) if decodes else None,
         "ttft_p50": round(statistics.median(ttfts), 3) if ttfts else None,
         "ttft_p90": round(pct(ttfts, 90), 3) if ttfts else None,
@@ -104,16 +112,23 @@ def main():
     base_agg = None
     for conc in levels:
         rs = [r for r in rows if r["concurrency"] == conc]
-        agg = statistics.mean([r["agg_tps"] for r in rs])
-        if conc == levels[0]:
+        aggs = [r["agg_tps"] for r in rs if r["agg_tps"] is not None]
+        agg = statistics.mean(aggs) if aggs else None
+        if conc == 1:
             base_agg = agg
-        per = statistics.mean([r["per_stream_decode_p50"] for r in rs if r["per_stream_decode_p50"]])
-        t50 = statistics.mean([r["ttft_p50"] for r in rs if r["ttft_p50"]])
-        t90 = statistics.mean([r["ttft_p90"] for r in rs if r["ttft_p90"]])
-        lat = statistics.mean([r["latency_p50"] for r in rs if r["latency_p50"]])
-        eff = (agg / (base_agg * conc)) if base_agg else None
-        print(f"| {conc} | {agg:.0f} | {per:.1f} | {t50:.2f}s | {t90:.2f}s | {lat:.1f}s | "
-              f"{eff * 100:.0f}% |" if eff else f"| {conc} | {agg:.0f} | {per:.1f} | {t50:.2f}s | {t90:.2f}s | {lat:.1f}s | - |")
+        per_l = [r["per_stream_decode_p50"] for r in rs if r["per_stream_decode_p50"]]
+        t50_l = [r["ttft_p50"] for r in rs if r["ttft_p50"]]
+        t90_l = [r["ttft_p90"] for r in rs if r["ttft_p90"]]
+        lat_l = [r["latency_p50"] for r in rs if r["latency_p50"]]
+        per = statistics.mean(per_l) if per_l else None
+        t50 = statistics.mean(t50_l) if t50_l else None
+        t90 = statistics.mean(t90_l) if t90_l else None
+        lat = statistics.mean(lat_l) if lat_l else None
+        eff = (agg / (base_agg * conc)) if (base_agg and agg) else None
+        def f(v, d=1, suf=""):
+            return "-" if v is None else f"{v:.{d}f}{suf}"
+        print(f"| {conc} | {f(agg, 0)} | {f(per)} | {f(t50, 2, 's')} | {f(t90, 2, 's')} | "
+              f"{f(lat, 1, 's')} | {(f'{eff * 100:.0f}%') if eff else '-'} |")
     print(f"\nsaved -> {out_dir}")
 
 

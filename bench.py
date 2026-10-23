@@ -18,10 +18,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 import requests
@@ -94,10 +96,22 @@ def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
     return (max(0.0, centre - half), min(1.0, centre + half))
 
 
-def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, retry=0):
+def _is_done(event: str) -> bool:
+    """SSE の終端は `data: [DONE]` という行の完全一致で判定する。
+
+    本文中に文字列 "[DONE]" が含まれるだけでは終端とみなさない。
+    """
+    return any(line.strip() == "data: [DONE]" for line in event.splitlines())
+
+
+def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, retry=0,
+                require_done=True):
     """1リクエストをストリーミングで実行し、観測契約（specs/metrics.md §1）に沿った値を返す。
 
-    失敗しても elapsed（失敗確定までの時間）を必ず返す。
+    - 終端: `data: [DONE]` の完全一致（require_done=True なら無い場合 truncated）
+    - deadline: monotonic な絶対期限。read timeout は idle 用に短く取る
+    - usage 不明は state と分離し、degraded として記録する
+    - 失敗しても elapsed（失敗確定までの時間）を必ず返す
     state: ok / empty / truncated / http_error / timeout / error
     """
     url = base.rstrip("/") + "/chat/completions"
@@ -110,6 +124,7 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
         "stream_options": {"include_usage": True},
     }
     t0 = time.perf_counter()
+    deadline = t0 + timeout
     ttft_any = None
     ttft_answer = None
     chunk_times = []
@@ -123,11 +138,16 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     state = "ok"
     for attempt in range(retry + 1):
         try:
-            with requests.post(url, json=body, stream=True, timeout=timeout) as r:
+            with requests.post(url, json=body, stream=True,
+                               timeout=(10, min(30.0, max(1.0, timeout)))) as r:
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
                 for event in _sse_events(r):
-                    if "[DONE]" in event:
+                    if time.perf_counter() > deadline:
+                        state = "timeout"
+                        last_err = f"absolute deadline {timeout}s exceeded"
+                        break
+                    if _is_done(event):
                         done_seen = True
                         continue
                     obj = _parse_event(event)
@@ -153,6 +173,8 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
                                 content_parts.append(piece)
                             if think:
                                 reasoning_parts.append(think)
+                if state == "timeout":
+                    break
             break
         except requests.exceptions.Timeout as e:  # noqa: BLE001
             last_err = e
@@ -166,17 +188,16 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     total = time.perf_counter() - t0
     content = "".join(content_parts)
     reasoning = "".join(reasoning_parts)
-    # 採点は最終回答(content)のみ。reasoning 内のコードで偶然通るのを防ぐ
     text = content
     completion = usage.get("completion_tokens")
     prompt_tokens = usage.get("prompt_tokens")
+    usage_available = isinstance(completion, int) and isinstance(prompt_tokens, int)
     itls = [b - a for a, b in zip(chunk_times, chunk_times[1:])]
     span = (chunk_times[-1] - chunk_times[0]) if len(chunk_times) > 1 else None
-    # クライアント観測出力レート。usage が無い場合 C は不明で、チャンク数で代用しない
-    R_out = ((completion - 1) / span) if (span and completion and completion > 1) else None
+    R_out = ((completion - 1) / span) if (span and usage_available and completion > 1) else None
 
     if state == "ok":
-        if not (done_seen or finish_reason):
+        if require_done and not done_seen:
             state = "truncated"
         elif not content.strip():
             state = "empty"
@@ -195,10 +216,12 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
         "itls": itls,
         "R_out": R_out,
         "usage": usage,
+        "usage_available": usage_available,
         "finish_reason": finish_reason,
         "done_seen": done_seen,
         "parse_errors": parse_errors,
         "state": state,
+        "degraded": (parse_errors > 0) or (not usage_available),
         "error": str(last_err) if last_err else None,
         "reasoning_chars": len(reasoning),
         "content_chars": len(content),
@@ -206,24 +229,20 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     }
 
 
-# ------------------------------------------------------------------ speed
-
-
 FILLER = (
-    "当社は1978年に大阪で創業し、当初は金属部品の加工を主力事業としていた。"
-    "1990年代には海外取引先との連携を強め、東南アジアに現地法人を設立した。"
-    "2005年には品質管理部門を独立させ、全社的な検査体制を再構築した。"
-    "2011年以降は環境負荷低減を経営課題と位置づけ、設備更新を段階的に進めた。"
-    "2016年からはIoTセンサーを導入し、生産ラインの稼働データを可視化している。"
+    "当社は2024年度からクラウド基盤への移行を進めており、現在は基幹系システムの7割が移行済みです。"
+    "移行に伴い運用コストは前年比12%削減され、障害対応時間も平均40分から18分に短縮されました。"
+    "一方で、移行に不慣れな現場部門からの問い合わせが増えており、教育コストの増加が課題となっています。"
+    "2025年度は残り3割の移行と、現場向けの研修プログラムの整備を同時に進める計画です。"
+    "本資料では、移行の進捗、コスト削減効果、現場の課題、次年度の計画について順に説明します。"
 )
 
 
-import uuid
-
-
 def build_prompt(chars: int) -> str:
-    # 先頭にユニークな salt を置き、prefix caching によるヒットを防ぐ
-    # （FILLER の繰り返しだと長いプロンプトが短いプロンプトの prefix を共有してしまう）
+    """指定文字数の日本語プロンプト。先頭に salt を置き、user 本文の cache 共有を防ぐ。
+
+    注意: salt は user 本文の先頭だけなので、system/template prefix の cache hit は防がない。
+    """
     head = f"資料番号 {uuid.uuid4().hex}。以下は社内文書です。内容を一文で要約してください。\n\n"
     reps = max(1, chars // len(FILLER) + 1)
     body = (FILLER * reps)[:chars]
@@ -231,23 +250,23 @@ def build_prompt(chars: int) -> str:
 
 
 def wait_ready(base, model, temperature=0.0, max_wait=1800):
-    """モデルが実際に応答できるまで待つ。TTFT が 3 秒未満になったら準備完了とみなす。
+    """モデルが応答可能になるまで待つ（warmup 用）。
 
-    モデル入れ替え式サーバーでは、リクエスト受付自体は返るがロード中のことがあり、
-    そのまま計測すると TTFT が数百秒になって prefill が負の傾きになる。
+    TTFT < 3s は「warm の代理指標」であり、resident 状態の確認ではない。
+    最初の観測 TTFT を cold と呼ぶのも、モデル未ロードを確認した場合に限る。
     """
     t_start = time.perf_counter()
-    cold = None
+    first_ttft = None
     attempts = 0
     while time.perf_counter() - t_start < max_wait:
         attempts += 1
         w = chat_stream(base, model, "こんにちは。短く返して。", max_tokens=8,
                         temperature=temperature, timeout=900)
         t = w["ttft"]
-        if cold is None:
-            cold = t
-        if t is not None and t < 3.0:
-            return cold, attempts
+        if first_ttft is None:
+            first_ttft = t
+        if t is not None and t < 3.0 and w["state"] in ("ok", "empty"):
+            return first_ttft, attempts
         time.sleep(10)
     raise RuntimeError(f"{model}: モデルが {max_wait}s 以内に準備完了しなかった")
 
@@ -260,25 +279,28 @@ def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
     time.sleep(0.5)
     samples = []
     for chars in lengths:
-        ts, tokens = [], None
+        ts, tokens, attempts = [], None, []
         for k in range(reps):
             # 反復ごとに salt を作り直す（同じプロンプトだと 2 回目以降が prefix cache に当たる）
             prompt = build_prompt(chars)
             r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
-            if r["ttft"] is None or not r["prompt_tokens"] or r["ttft"] >= 30:
-                time.sleep(5)
-                r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
-            if r["ttft"] is not None and r["prompt_tokens"] and r["ttft"] < 30:
+            valid = (r["ttft"] is not None and r["prompt_tokens"]
+                     and r["state"] in ("ok", "empty", "truncated") and r["ttft"] < 30)
+            attempts.append({"ttft": r["ttft"], "prompt_tokens": r["prompt_tokens"],
+                             "state": r["state"], "valid": bool(valid)})
+            if valid:
                 ts.append(r["ttft"])
                 tokens = r["prompt_tokens"]
             if k < reps - 1:
                 time.sleep(gap)
         if not ts:
-            raise RuntimeError(f"prefill probe failed ({chars} chars): {r['error']}")
+            raise RuntimeError(f"prefill probe failed ({chars} chars): 有効な試行なし "
+                               f"(states={[a['state'] for a in attempts]})")
         samples.append({"chars": chars, "prompt_tokens": tokens,
                         "ttft": round(statistics.median(ts), 4),
                         "ttft_all": [round(t, 4) for t in ts],
-                        "reps": len(ts),
+                        "requested": reps, "valid": len(ts), "failed": reps - len(ts),
+                        "attempts": attempts,
                         "tokens_per_char": round(tokens / chars, 3)})
         time.sleep(0.3)
 
@@ -302,6 +324,9 @@ def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
         "samples": samples,
         "mean_tokens_per_char": round(
             sum(s["tokens_per_char"] for s in samples) / len(samples), 3),
+        "requested": reps * len(samples),
+        "valid": sum(s["valid"] for s in samples),
+        "failed": sum(s["failed"] for s in samples),
         "probe_reps": reps,
         "note": "TTFTの傾き法（反復ごとに salt を変え prefix cache を外す）。切片=ネットワーク+キュー待ち+固定オーバーヘッド",
     }
@@ -312,33 +337,42 @@ DECODE_TOKENS = 256
 
 
 def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
-    """decode probe を reps 回実行し、中央値で返す（サーバー状態の振れを均す）。"""
+    """decode probe を reps 回実行し、有効試行の中央値で返す。
+
+    失敗試行も runs に残す（無申告の再送・棄却をしない）。
+    """
     runs = []
     for k in range(reps):
         r = chat_stream(base, model, DECODE_PROMPT, max_tokens=DECODE_TOKENS, temperature=temperature)
-        if r["state"] != "ok":
-            if not runs:
-                raise RuntimeError(f"decode probe state={r['state']}: {r['error']}")
-        else:
-            itls = r["itls"]
-            runs.append({
-                "R_out": r["R_out"],
-                "gap_p50_ms": (statistics.median(itls) * 1000) if itls else None,
-                "gap_p90_ms": ((sorted(itls)[int(len(itls) * 0.9) - 1] * 1000)
-                                if len(itls) > 1 else ((itls[0] * 1000) if itls else None)),
-                "tokens_per_chunk": round(r["completion_tokens"] / len(itls), 2) if (r["completion_tokens"] and itls) else None,
-                "ttft_any": r["ttft_any"],
-                "ttft_answer": r["ttft_answer"],
-                "completion_tokens": r["completion_tokens"],
-                "itl_samples": len(itls),
-            })
+        itls = r["itls"]
+        valid = (r["state"] in ("ok", "empty", "truncated") and r["usage_available"]
+                 and r["R_out"] is not None)
+        runs.append({
+            "state": r["state"],
+            "valid": bool(valid),
+            "usage_available": r["usage_available"],
+            "R_out": r["R_out"],
+            "gap_p50_ms": (statistics.median(itls) * 1000) if itls else None,
+            "gap_p90_ms": ((sorted(itls)[int(len(itls) * 0.9) - 1] * 1000)
+                            if len(itls) > 1 else ((itls[0] * 1000) if itls else None)),
+            "tokens_per_chunk": round(r["completion_tokens"] / len(itls), 2)
+            if (r["completion_tokens"] and itls) else None,
+            "ttft_any": r["ttft_any"],
+            "ttft_answer": r["ttft_answer"],
+            "completion_tokens": r["completion_tokens"],
+            "itl_samples": len(itls),
+        })
         if k < reps - 1:
             time.sleep(gap)
 
+    valid_runs = [x for x in runs if x["valid"]]
+
     def med(key):
-        vals = [x[key] for x in runs if x[key] is not None]
+        vals = [x[key] for x in valid_runs if x[key] is not None]
         return round(statistics.median(vals), 3) if vals else None
 
+    if not valid_runs:
+        raise RuntimeError(f"decode probe: 有効な試行なし (states={[x['state'] for x in runs]})")
     return {
         "R_out_tok_per_s": round(med("R_out"), 1) if med("R_out") else None,
         "p50_inter_chunk_gap_ms": med("gap_p50_ms"),
@@ -349,7 +383,10 @@ def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
         "completion_tokens": med("completion_tokens"),
         "itl_samples": med("itl_samples"),
         "state": "ok",
-        "probe_reps": len(runs),
+        "requested": reps,
+        "valid": len(valid_runs),
+        "failed": reps - len(valid_runs),
+        "probe_reps": len(valid_runs),
         "runs": runs,
     }
 
@@ -357,7 +394,7 @@ def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
 # ------------------------------------------------------------------ tasks
 
 
-def run_tasks(base, model, task_ids, runs, temperature):
+def run_tasks(base, model, task_ids, runs, temperature, save_full=True):
     results = []
     for tid in task_ids:
         task = TASK_BY_ID[tid]
@@ -403,9 +440,16 @@ def run_tasks(base, model, task_ids, runs, temperature):
                 "reasoning_chars": r["reasoning_chars"],
                 "content_chars": r["content_chars"],
                 "reasoning_repeat_ratio": r["reasoning_repeat_ratio"],
+                "l": round(r["l"], 3) if r["l"] else None,
+                "done_seen": r["done_seen"],
+                "parse_errors": r["parse_errors"],
+                "usage_available": r["usage_available"],
+                "degraded": r["degraded"],
+                "usage": r["usage"],
                 "reasoning_head": r["reasoning"][:2000],
                 "reasoning_tail": r["reasoning"][-2000:],
-                "output": r["text"][:4000],
+                "reasoning": r["reasoning"] if save_full else None,
+                "output": r["text"] if save_full else r["text"][:4000],
             })
             print(f"    {tid} run{i}: {state.upper()} {elapsed:.1f}s "
                   f"({str(detail)[:60]})", flush=True)
@@ -494,7 +538,6 @@ def markdown(results):
                   f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (全試行平均, {sm['task_runs']}回) |",
                   f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']})"
                   + (f" / 正常応答内 {sm['quality_rate'] * 100:.0f}%" if sm.get("quality_rate") is not None else "")
-                  + (f" / 95%CI {sm['success_rate_ci95'][0] * 100:.0f}–{sm['success_rate_ci95'][1] * 100:.0f}%" if sm.get("success_rate_ci95") else "")
                   + " |",
                   f"| Task 完全合格 | {sm.get('task_pass_rate', 0) * 100:.0f}%"
                   + (f" (95%CI {sm['task_pass_ci95'][0] * 100:.0f}–{sm['task_pass_ci95'][1] * 100:.0f}%)" if sm.get("task_pass_ci95") else "") + " |",
@@ -502,6 +545,10 @@ def markdown(results):
                   ""]
         if sm.get("degraded"):
             lines.append(f"- **degraded**: grader_error {sm['grader_errors']}件（測定不能）")
+        if sm.get("success_rate_ci95"):
+            lines.append(
+                f"- 成功率の Wilson 95%CI: {sm['success_rate_ci95'][0] * 100:.0f}–{sm['success_rate_ci95'][1] * 100:.0f}%"
+                "（naive iid。反復はクラスタ内反復なので過小評価）")
         if sm.get("mean_reasoning_repeat") is not None:
             lines.append(f"- reasoning 行重複率（平均）: {sm['mean_reasoning_repeat']:.2f}（高いほど反復・degeneration）")
         if sm.get("states"):
@@ -591,12 +638,17 @@ def build_manifest(args, model, task_ids, run_id):
 
 
 def write_raw(out_dir, all_results, manifest):
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+    """SUT ごとに manifest を分けて保存し、attempt には sut 名を付ける。"""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", manifest["sut"]["name"])[:80]
+    with open(os.path.join(out_dir, f"manifest_{safe}.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+    if len(all_results) == 1:
+        with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
     with open(os.path.join(out_dir, "attempts.jsonl"), "w", encoding="utf-8") as f:
         for res in all_results:
             for t in res["tasks"]:
-                rec = {"run_id": manifest["run_id"], "model": res["model"], **t}
+                rec = {"run_id": manifest["run_id"], "sut": res["model"], **t}
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -623,6 +675,8 @@ def main():
                     help="prefill/decode probe の反復回数（中央値を採用）")
     ap.add_argument("--probe-gap", type=float, default=2.0,
                     help="probe 反復間の idle 秒")
+    ap.add_argument("--no-full-text", action="store_true",
+                    help="生ログの回答全文・reasoning 全文を保存しない（既定は保存）")
     args = ap.parse_args()
 
     models = [m.strip() for m in args.model.split(",") if m.strip()]
@@ -675,7 +729,8 @@ def main():
                      "cold_start_ttft_s": cold}
 
         print(f"  tasks: {len(task_ids)} x {args.runs} runs", flush=True)
-        task_results = run_tasks(args.base_url, model, task_ids, args.runs, args.temperature)
+        task_results = run_tasks(args.base_url, model, task_ids, args.runs, args.temperature,
+                                  save_full=not args.no_full_text)
         res = summarize(model, speed, task_results)
         all_results.append(res)
 
