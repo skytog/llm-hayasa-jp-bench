@@ -119,7 +119,9 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600):
     prompt_tokens = usage.get("prompt_tokens")
     itls = [b - a for a, b in zip(chunk_times, chunk_times[1:])]
     decode_span = (chunk_times[-1] - chunk_times[0]) if len(chunk_times) > 1 else None
-    decode_tps = ((len(chunk_times) - 1) / decode_span) if decode_span and decode_span > 0 else None
+    # チャンクには複数トークンがまとまって届くことがある（実測 4.3 tok/chunk）ため、
+    # チャンク数ではなく usage の completion_tokens で割る
+    decode_tps = ((completion - 1) / decode_span) if (decode_span and completion > 1) else None
     return {
         "text": text,
         "content": content,
@@ -234,13 +236,17 @@ def measure_decode(base, model, temperature=0.0):
     itls = r["itls"]
     p50 = statistics.median(itls)
     p90 = sorted(itls)[int(len(itls) * 0.9) - 1] if len(itls) > 1 else itls[0]
+    span = r["total"] - r["ttft"] if r["ttft"] else None
+    tokens = r["completion_tokens"]
     return {
         "decode_tps": r["decode_tps"],
         "decode_tps_p50": (1 / p50) if p50 > 0 else None,
         "p50_itl_ms": p50 * 1000,
         "p90_itl_ms": p90 * 1000,
+        "token_itl_ms": (span / (tokens - 1) * 1000) if (span and tokens and tokens > 1) else None,
+        "tokens_per_chunk": round(tokens / len(itls), 2) if itls else None,
         "ttft": r["ttft"],
-        "completion_tokens": r["completion_tokens"],
+        "completion_tokens": tokens,
         "itl_samples": len(itls),
     }
 
