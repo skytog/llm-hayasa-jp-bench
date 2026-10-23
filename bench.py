@@ -64,11 +64,23 @@ def _parse_event(event: str):
 
 
 def _repeat_ratio(text: str) -> float | None:
-    """reasoning の行重複率（反復・degeneration の検出）。行数が少なければ None。"""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if len(lines) < 20:
+    """reasoning の文字 8-gram 重複率（反復・degeneration の検出）。
+
+    行単位だと「言い換えループ」を取り逃すため、空白除去後の文字 n-gram で測る。
+    """
+    import re
+    from collections import Counter
+
+    t = re.sub(r"\s+", "", text)
+    if len(t) < 400:
         return None
-    return round(1 - len(set(lines)) / len(lines), 3)
+    n, stride = 8, 2
+    grams = [t[i:i + n] for i in range(0, len(t) - n, stride)]
+    if not grams:
+        return None
+    c = Counter(grams)
+    dup = sum(v for v in c.values() if v > 1)
+    return round(dup / len(grams), 3)
 
 
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
@@ -356,6 +368,8 @@ def run_tasks(base, model, task_ids, runs, temperature):
                 "reasoning_chars": r["reasoning_chars"],
                 "content_chars": r["content_chars"],
                 "reasoning_repeat_ratio": r["reasoning_repeat_ratio"],
+                "reasoning_head": r["reasoning"][:2000],
+                "reasoning_tail": r["reasoning"][-2000:],
                 "output": r["text"][:4000],
             })
             print(f"    {tid} run{i}: {state.upper()} {elapsed:.1f}s "
