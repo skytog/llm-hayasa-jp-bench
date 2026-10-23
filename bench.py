@@ -306,12 +306,13 @@ def run_tasks(base, model, task_ids, runs, temperature):
                 continue
             elapsed = r["total"]
             state = r["state"]
+            # 最終回答が出ていない場合、length なら予算切れとして区別する
+            if state == "empty" and r["finish_reason"] == "length":
+                state = "budget_exhausted"
             if state != "ok":
                 passed, detail = False, f"state={state} finish={r['finish_reason']} err={str(r['error'])[:120]}"
             elif not r["content"].strip():
                 passed, detail = False, "empty content"
-                if r["finish_reason"] == "length":
-                    state = "budget_exhausted"
             else:
                 try:
                     passed, detail = task["grader"](r["text"], r)
