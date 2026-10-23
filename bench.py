@@ -63,6 +63,25 @@ def _parse_event(event: str):
             return None
 
 
+def _repeat_ratio(text: str) -> float | None:
+    """reasoning の行重複率（反復・degeneration の検出）。行数が少なければ None。"""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 20:
+        return None
+    return round(1 - len(set(lines)) / len(lines), 3)
+
+
+def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    """二項比率の Wilson 95% 信頼区間。"""
+    if n <= 0:
+        return None
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = (z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
 def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, retry=0):
     """1リクエストをストリーミングで実行し、観測契約（specs/metrics.md §1）に沿った値を返す。
 
@@ -169,6 +188,9 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
         "parse_errors": parse_errors,
         "state": state,
         "error": str(last_err) if last_err else None,
+        "reasoning_chars": len(reasoning),
+        "content_chars": len(content),
+        "reasoning_repeat_ratio": _repeat_ratio(reasoning),
     }
 
 
@@ -331,6 +353,9 @@ def run_tasks(base, model, task_ids, runs, temperature):
                 "prompt_tokens": r["prompt_tokens"],
                 "completion_tokens": r["completion_tokens"],
                 "finish_reason": r["finish_reason"],
+                "reasoning_chars": r["reasoning_chars"],
+                "content_chars": r["content_chars"],
+                "reasoning_repeat_ratio": r["reasoning_repeat_ratio"],
                 "output": r["text"][:4000],
             })
             print(f"    {tid} run{i}: {state.upper()} {elapsed:.1f}s "
@@ -371,6 +396,12 @@ def summarize(model, speed, task_results):
     states = {}
     for r in task_results:
         states[r.get("state", "unknown")] = states.get(r.get("state", "unknown"), 0) + 1
+    # 不確実性: attempt 単位（クラスタ内反復のため過小評価）と task 単位
+    ci = wilson_ci(passes, total_runs)
+    task_all_pass = sum(1 for p in per_task if p["rate"] == 1.0)
+    task_ci = wilson_ci(task_all_pass, len(per_task))
+    repeats = [r["reasoning_repeat_ratio"] for r in task_results
+               if r.get("reasoning_repeat_ratio") is not None]
     return {
         "model": model,
         "speed": speed,
@@ -380,11 +411,15 @@ def summarize(model, speed, task_results):
             "task_runs": total_runs,
             "task_passes": passes,
             "success_rate": round(success_rate, 4),
+            "success_rate_ci95": [round(x, 4) for x in ci] if ci else None,
+            "task_pass_rate": round(task_all_pass / len(per_task), 4) if per_task else None,
+            "task_pass_ci95": [round(x, 4) for x in task_ci] if task_ci else None,
             "quality_rate": round(quality_rate, 4) if quality_rate is not None else None,
             "grader_errors": grader_errors,
             "degraded": grader_errors > 0,
             "mean_task_time_s": round(mean_time, 2) if mean_time else None,
             "time_to_pass_s": round(ttp, 2) if ttp else None,
+            "mean_reasoning_repeat": round(statistics.mean(repeats), 3) if repeats else None,
             "states": states,
         },
     }
@@ -408,11 +443,17 @@ def markdown(results):
                   f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms) |",
                   f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (全試行平均, {sm['task_runs']}回) |",
                   f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']})"
-                  + (f" / 正常応答内 {sm['quality_rate'] * 100:.0f}%" if sm.get("quality_rate") is not None else "") + " |",
+                  + (f" / 正常応答内 {sm['quality_rate'] * 100:.0f}%" if sm.get("quality_rate") is not None else "")
+                  + (f" / 95%CI {sm['success_rate_ci95'][0] * 100:.0f}–{sm['success_rate_ci95'][1] * 100:.0f}%" if sm.get("success_rate_ci95") else "")
+                  + " |",
+                  f"| Task 完全合格 | {sm.get('task_pass_rate', 0) * 100:.0f}%"
+                  + (f" (95%CI {sm['task_pass_ci95'][0] * 100:.0f}–{sm['task_pass_ci95'][1] * 100:.0f}%)" if sm.get("task_pass_ci95") else "") + " |",
                   f"| TTP (観測時間/成功) | {fmt(sm.get('time_to_pass_s'), 1)} s |",
                   ""]
         if sm.get("degraded"):
             lines.append(f"- **degraded**: grader_error {sm['grader_errors']}件（測定不能）")
+        if sm.get("mean_reasoning_repeat") is not None:
+            lines.append(f"- reasoning 行重複率（平均）: {sm['mean_reasoning_repeat']:.2f}（高いほど反復・degeneration）")
         if sm.get("states"):
             lines.append("- 状態: " + ", ".join(f"{k}={v}" for k, v in sorted(sm["states"].items())))
         if s.get("cold_start_ttft_s") is not None:
