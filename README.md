@@ -21,6 +21,17 @@ Prefill / Decode は「素の推論性能」、Task Time / Success Rate / TTP �
 - `specs/scoring.md` — 採点契約（strict schema / 最終行のみ / NaN拒否 / sentinel偽装対策 / 状態分類）
 - `specs/result-schema.json` — 結果 JSON スキーマ
 
+## 隔離実行と生データ
+
+- コードタスクの採点は **docker で隔離実行**（`--network none`, `--read-only`, tmpfs, memory 512m, pids 128, cpus 1）。docker が無い場合は subprocess にフォールバックし、`detail` に `sandbox=none` と記録する
+- 各 run は `manifest.json`（SUT 識別子・量子化・engine・GPU・sampling・cache・dataset hash・grader version）と `attempts.jsonl`（attempt 単位の時刻・usage・finish_reason・state・全文）を残す
+- SUT メタデータは `--sut-meta k=v` で渡す:
+  ```bash
+  python3 bench.py --model X --sut-meta quantization=EXL3-4bpw --sut-meta engine=vllm \
+    --sut-meta engine_version=0.11 --sut-meta gpu=GB10 --sut-meta gpu_count=2 \
+    --sut-meta tp=2 --sut-meta network=tailscale --cache-mode off
+  ```
+
 ## 使い方
 
 ```bash

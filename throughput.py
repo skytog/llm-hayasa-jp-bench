@@ -98,7 +98,8 @@ def main():
     with open(os.path.join(out_dir, "throughput.json"), "w", encoding="utf-8") as f:
         json.dump({"model": args.model, "rows": rows}, f, ensure_ascii=False, indent=2)
 
-    print("\n| 並列数 | 合計 tok/s | 1本あたり decode | TTFT p50 | TTFT p90 | 完了時間 p50 | スケール効率 |")
+    print("\n### finite burst（c本を一括投入し全終了まで待つ makespan throughput。定常容量ではない）\n")
+    print("| 並列数 | burst合計 tok/s | 1本あたり R_out | TTFT p50 | TTFT p90 | 完了時間 p50 | スケール効率 |")
     print("|---|---|---|---|---|---|---|")
     base_agg = None
     for conc in levels:

@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -432,6 +434,80 @@ def markdown(results):
     return "\n".join(lines)
 
 
+def _git_commit():
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                           cwd=os.path.dirname(os.path.abspath(__file__)),
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def dataset_hash(task_ids):
+    payload = [[t, TASK_BY_ID[t]["prompt"], TASK_BY_ID[t].get("max_tokens")] for t in task_ids]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+
+
+def build_manifest(args, model, task_ids, run_id):
+    meta = {}
+    for kv in args.sut_meta:
+        k, _, v = kv.partition("=")
+        if k.strip():
+            meta[k.strip()] = v.strip()
+    commit = _git_commit()
+    return {
+        "schema_version": "0.1",
+        "run_id": run_id,
+        "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "sut": {
+            "name": model,
+            "model_revision": meta.get("model_revision"),
+            "quantization": meta.get("quantization"),
+            "tokenizer_hash": meta.get("tokenizer_hash"),
+            "chat_template_hash": meta.get("chat_template_hash"),
+            "engine": {"name": meta.get("engine", "unknown"),
+                       "version": meta.get("engine_version", "unknown"),
+                       "args": []},
+            "gpu": {"type": meta.get("gpu", "unknown"),
+                    "count": int(meta.get("gpu_count", 0) or 0),
+                    "driver": meta.get("driver")},
+            "parallelism": {k: int(v) for k, v in meta.items()
+                            if k in ("tp", "ep", "dp") and str(v).isdigit()},
+            "speculative": {"method": meta["speculative"]} if "speculative" in meta else None,
+            "sampling": {"temperature": args.temperature, "top_p": None, "seed": None},
+            "cache": {"mode": args.cache_mode},
+            "context_limit": int(meta["context_limit"]) if str(meta.get("context_limit", "")).isdigit() else None,
+        },
+        "endpoint": {
+            "base_url": args.base_url.split("/v1")[0],
+            "client_version": commit,
+            "network": meta.get("network", "unknown"),
+        },
+        "protocol": {
+            "scenario": args.scenario,
+            "repetitions": args.runs,
+            "timeout_s": 900,
+            "retry": "off",
+            "max_tokens_policy": "per-task (tasks.py)",
+            "seed": None,
+        },
+        "dataset": {"name": "ja_smoke_v1", "hash": dataset_hash(task_ids),
+                    "task_count": len(task_ids)},
+        "grader": {"version": commit, "contract": "strict_v1"},
+    }
+
+
+def write_raw(out_dir, all_results, manifest):
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(out_dir, "attempts.jsonl"), "w", encoding="utf-8") as f:
+        for res in all_results:
+            for t in res["tasks"]:
+                rec = {"run_id": manifest["run_id"], "model": res["model"], **t}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 # ------------------------------------------------------------------ main
 
 
@@ -447,6 +523,10 @@ def main():
     ap.add_argument("--no-speed", action="store_true")
     ap.add_argument("--no-warmup", action="store_true")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--sut-meta", action="append", default=[], metavar="K=V",
+                    help="SUT のメタデータ（quantization=EXL3-4bpw, engine=vllm など）")
+    ap.add_argument("--cache-mode", default="unknown", choices=["off", "on", "unknown"])
+    ap.add_argument("--scenario", default="S1", choices=["S1", "S2", "S3"])
     args = ap.parse_args()
 
     models = [m.strip() for m in args.model.split(",") if m.strip()]
@@ -480,7 +560,9 @@ def main():
             print(f"    prefill: {fmt(pre['prefill_tps'], 0)} tok/s (R2={fmt(pre['r2'], 3)})", flush=True)
             print("  decode probe...", flush=True)
             dec = measure_decode(args.base_url, model, args.temperature)
-            print(f"    decode: {fmt(dec['decode_tps'], 1)} tok/s", flush=True)
+            print(f"    R_out: {fmt(dec['R_out_tok_per_s'], 1)} tok/s "
+                  f"(inter-chunk gap p50 {fmt(dec['p50_inter_chunk_gap_ms'], 1)} ms, "
+                  f"{fmt(dec['tokens_per_chunk'], 2)} tok/chunk)", flush=True)
             speed = {"prefill": pre, "decode": dec,
                      "prefill_tps": pre["prefill_tps"],
                      "intercept_s": pre["intercept_s"],
@@ -499,6 +581,8 @@ def main():
 
         with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as f:
             json.dump(all_results, f, ensure_ascii=False, indent=2)
+        manifest = build_manifest(args, model, task_ids, os.path.basename(out_dir))
+        write_raw(out_dir, all_results, manifest)
         with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
             f.write(markdown(all_results))
         print(f"  saved -> {out_dir}", flush=True)

@@ -70,18 +70,32 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s))
 
 
-def _run_code(code: str, tests: str, timeout: int = 30) -> tuple[bool, str]:
-    """候補コードを別プロセスで実行する（specs/scoring.md §2.1）。
+_DOCKER_OK = None
 
-    sentinel 偽装対策: ハーネス側がランダム nonce を生成し、テスト完了後に
-    `ALL_PASS:<nonce>` を出す。候補は nonce を知らないので
-    `print("ALL_PASS")` や `os._exit(0)` だけでは通らない。
-    完全な隔離（network/secrets/read-only host/資源制限）は P1 の sandbox 要件。
+
+def _docker_available() -> bool:
+    global _DOCKER_OK
+    if _DOCKER_OK is None:
+        try:
+            r = subprocess.run(["sg", "docker", "-c", "docker info"], capture_output=True, timeout=15)
+            _DOCKER_OK = r.returncode == 0
+        except Exception:  # noqa: BLE001
+            _DOCKER_OK = False
+    return _DOCKER_OK
+
+
+def _run_code(code: str, tests: str, timeout: int = 60) -> tuple[bool, str]:
+    """候補コードを隔離環境で実行する（specs/scoring.md §2.1）。
+
+    - docker: network none / read-only root / tmpfs / memory 512m / pids 128 / cpus 1
+    - sentinel 偽装対策: ハーネスが nonce を生成し、テスト完了後に `ALL_PASS:<nonce>` を出す
+    - docker が使えない場合は subprocess にフォールバックし、detail に sandbox=none と記す
     """
+    import shlex
     import uuid
 
     nonce = uuid.uuid4().hex
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         sol = os.path.join(d, "sol.py")
         runner = os.path.join(d, "run_tests.py")
         with open(sol, "w", encoding="utf-8") as f:
@@ -95,15 +109,42 @@ def _run_code(code: str, tests: str, timeout: int = 30) -> tuple[bool, str]:
                 + tests
                 + f"\nprint('ALL_PASS:{nonce}')\n"
             )
+        marker = f"ALL_PASS:{nonce}"
+
+        if _docker_available():
+            os.chmod(d, 0o777)
+            name = f"llmbench-{nonce[:8]}"
+            cmd = [
+                "docker", "run", "--rm", "--name", name,
+                "--network", "none", "--read-only",
+                "--tmpfs", "/tmp:rw,size=8m",
+                "-v", f"{d}:/work:rw",
+                "--memory", "512m", "--memory-swap", "512m",
+                "--pids-limit", "128", "--cpus", "1",
+                "-w", "/work",
+                "python:3.12-slim", "python", "-I", "-B", "/work/run_tests.py",
+            ]
+            try:
+                r = subprocess.run(["sg", "docker", "-c", shlex.join(cmd)],
+                                   capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["sg", "docker", "-c", f"docker rm -f {name}"],
+                               capture_output=True, timeout=20)
+                return False, "timeout (sandbox=docker)"
+            if r.returncode == 0 and marker in r.stdout:
+                return True, "ok (sandbox=docker)"
+            err = (r.stderr or r.stdout).strip().splitlines()
+            return False, " | ".join(err[-3:])[:300]
+
+        # フォールバック（隔離なし）
         env = {"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"}
         try:
-            r = subprocess.run([sys.executable, "-I", runner], capture_output=True,
+            r = subprocess.run([sys.executable, "-I", "-B", runner], capture_output=True,
                                text=True, timeout=timeout, cwd=d, env=env)
         except subprocess.TimeoutExpired:
-            return False, "timeout"
-        marker = f"ALL_PASS:{nonce}"
+            return False, "timeout (sandbox=none)"
         if r.returncode == 0 and marker in r.stdout:
-            return True, "ok"
+            return True, "ok (sandbox=none)"
         err = (r.stderr or r.stdout).strip().splitlines()
         return False, " | ".join(err[-3:])[:300]
 
