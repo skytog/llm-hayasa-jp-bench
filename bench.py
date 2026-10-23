@@ -252,7 +252,7 @@ def wait_ready(base, model, temperature=0.0, max_wait=1800):
     raise RuntimeError(f"{model}: モデルが {max_wait}s 以内に準備完了しなかった")
 
 
-def measure_prefill(base, model, lengths, temperature=0.0):
+def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
     """TTFT = a + b * prompt_tokens を最小二乗で当てはめ、1/b を prefill tok/s とする。"""
     # 最初の1本は捨てる（キャッシュ初期化などを避ける）
     chat_stream(base, model, build_prompt(min(lengths)), max_tokens=8,
@@ -260,17 +260,26 @@ def measure_prefill(base, model, lengths, temperature=0.0):
     time.sleep(0.5)
     samples = []
     for chars in lengths:
-        prompt = build_prompt(chars)
-        for attempt in range(3):
+        ts, tokens = [], None
+        for k in range(reps):
+            # 反復ごとに salt を作り直す（同じプロンプトだと 2 回目以降が prefix cache に当たる）
+            prompt = build_prompt(chars)
             r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
+            if r["ttft"] is None or not r["prompt_tokens"] or r["ttft"] >= 30:
+                time.sleep(5)
+                r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
             if r["ttft"] is not None and r["prompt_tokens"] and r["ttft"] < 30:
-                break
-            time.sleep(5)
-        else:
+                ts.append(r["ttft"])
+                tokens = r["prompt_tokens"]
+            if k < reps - 1:
+                time.sleep(gap)
+        if not ts:
             raise RuntimeError(f"prefill probe failed ({chars} chars): {r['error']}")
-        samples.append({"chars": chars, "prompt_tokens": r["prompt_tokens"],
-                        "ttft": round(r["ttft"], 4),
-                        "tokens_per_char": round(r["prompt_tokens"] / chars, 3)})
+        samples.append({"chars": chars, "prompt_tokens": tokens,
+                        "ttft": round(statistics.median(ts), 4),
+                        "ttft_all": [round(t, 4) for t in ts],
+                        "reps": len(ts),
+                        "tokens_per_char": round(tokens / chars, 3)})
         time.sleep(0.3)
 
     xs = [s["prompt_tokens"] for s in samples]
@@ -293,7 +302,8 @@ def measure_prefill(base, model, lengths, temperature=0.0):
         "samples": samples,
         "mean_tokens_per_char": round(
             sum(s["tokens_per_char"] for s in samples) / len(samples), 3),
-        "note": "TTFTの傾き法。切片=ネットワーク+キュー待ち+固定オーバーヘッド",
+        "probe_reps": reps,
+        "note": "TTFTの傾き法（反復ごとに salt を変え prefix cache を外す）。切片=ネットワーク+キュー待ち+固定オーバーヘッド",
     }
 
 
@@ -301,24 +311,46 @@ DECODE_PROMPT = "1から200までの整数を1行に1つずつ、何も付け加
 DECODE_TOKENS = 256
 
 
-def measure_decode(base, model, temperature=0.0):
-    r = chat_stream(base, model, DECODE_PROMPT, max_tokens=DECODE_TOKENS, temperature=temperature)
-    if r["state"] != "ok":
-        raise RuntimeError(f"decode probe state={r['state']}: {r['error']}")
-    itls = r["itls"]
-    tokens = r["completion_tokens"]
-    gap_p50 = statistics.median(itls) if itls else None
-    gap_p90 = (sorted(itls)[int(len(itls) * 0.9) - 1] if len(itls) > 1 else (itls[0] if itls else None))
+def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0):
+    """decode probe を reps 回実行し、中央値で返す（サーバー状態の振れを均す）。"""
+    runs = []
+    for k in range(reps):
+        r = chat_stream(base, model, DECODE_PROMPT, max_tokens=DECODE_TOKENS, temperature=temperature)
+        if r["state"] != "ok":
+            if not runs:
+                raise RuntimeError(f"decode probe state={r['state']}: {r['error']}")
+        else:
+            itls = r["itls"]
+            runs.append({
+                "R_out": r["R_out"],
+                "gap_p50_ms": (statistics.median(itls) * 1000) if itls else None,
+                "gap_p90_ms": ((sorted(itls)[int(len(itls) * 0.9) - 1] * 1000)
+                                if len(itls) > 1 else ((itls[0] * 1000) if itls else None)),
+                "tokens_per_chunk": round(r["completion_tokens"] / len(itls), 2) if (r["completion_tokens"] and itls) else None,
+                "ttft_any": r["ttft_any"],
+                "ttft_answer": r["ttft_answer"],
+                "completion_tokens": r["completion_tokens"],
+                "itl_samples": len(itls),
+            })
+        if k < reps - 1:
+            time.sleep(gap)
+
+    def med(key):
+        vals = [x[key] for x in runs if x[key] is not None]
+        return round(statistics.median(vals), 3) if vals else None
+
     return {
-        "R_out_tok_per_s": r["R_out"],
-        "p50_inter_chunk_gap_ms": gap_p50 * 1000 if gap_p50 else None,
-        "p90_inter_chunk_gap_ms": gap_p90 * 1000 if gap_p90 else None,
-        "tokens_per_chunk": round(tokens / len(itls), 2) if (tokens and itls) else None,
-        "ttft_any_s": r["ttft_any"],
-        "ttft_answer_s": r["ttft_answer"],
-        "completion_tokens": tokens,
-        "itl_samples": len(itls),
-        "state": r["state"],
+        "R_out_tok_per_s": round(med("R_out"), 1) if med("R_out") else None,
+        "p50_inter_chunk_gap_ms": med("gap_p50_ms"),
+        "p90_inter_chunk_gap_ms": med("gap_p90_ms"),
+        "tokens_per_chunk": med("tokens_per_chunk"),
+        "ttft_any_s": med("ttft_any"),
+        "ttft_answer_s": med("ttft_answer"),
+        "completion_tokens": med("completion_tokens"),
+        "itl_samples": med("itl_samples"),
+        "state": "ok",
+        "probe_reps": len(runs),
+        "runs": runs,
     }
 
 
@@ -456,9 +488,9 @@ def markdown(results):
         sm = res["summary"]
         lines += [f"## {res['model']}", "",
                   "| 指標 | 値 |", "|---|---|",
-                  f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s (傾き法, R²={fmt(s.get('r2'), 3)}) |",
+                  f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s (傾き法, R²={fmt(s.get('r2'), 3)}, n={s.get('probe_reps', '-')}中央値) |",
                   f"| 日本語トークン効率 | {fmt(s.get('tokens_per_char'), 3)} tok/文字（入力。1文字1トークン超は日本語の割高） |",
-                  f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms) |",
+                  f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms, n={s.get('probe_reps', '-')}中央値) |",
                   f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (全試行平均, {sm['task_runs']}回) |",
                   f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']})"
                   + (f" / 正常応答内 {sm['quality_rate'] * 100:.0f}%" if sm.get("quality_rate") is not None else "")
@@ -587,6 +619,10 @@ def main():
                     help="SUT のメタデータ（quantization=EXL3-4bpw, engine=vllm など）")
     ap.add_argument("--cache-mode", default="unknown", choices=["off", "on", "unknown"])
     ap.add_argument("--scenario", default="S1", choices=["S1", "S2", "S3"])
+    ap.add_argument("--probe-reps", type=int, default=3,
+                    help="prefill/decode probe の反復回数（中央値を採用）")
+    ap.add_argument("--probe-gap", type=float, default=2.0,
+                    help="probe 反復間の idle 秒")
     args = ap.parse_args()
 
     models = [m.strip() for m in args.model.split(",") if m.strip()]
@@ -616,10 +652,12 @@ def main():
         if not args.no_speed:
             lengths = [int(x) for x in args.prefill_lengths.split(",")]
             print(f"  prefill probe (chars={lengths})...", flush=True)
-            pre = measure_prefill(args.base_url, model, lengths, args.temperature)
+            pre = measure_prefill(args.base_url, model, lengths, args.temperature,
+                                   args.probe_reps, args.probe_gap)
             print(f"    prefill: {fmt(pre['prefill_tps'], 0)} tok/s (R2={fmt(pre['r2'], 3)})", flush=True)
             print("  decode probe...", flush=True)
-            dec = measure_decode(args.base_url, model, args.temperature)
+            dec = measure_decode(args.base_url, model, args.temperature,
+                                  args.probe_reps, args.probe_gap)
             print(f"    R_out: {fmt(dec['R_out_tok_per_s'], 1)} tok/s "
                   f"(inter-chunk gap p50 {fmt(dec['p50_inter_chunk_gap_ms'], 1)} ms, "
                   f"{fmt(dec['tokens_per_chunk'], 2)} tok/chunk)", flush=True)
@@ -629,6 +667,7 @@ def main():
                      "r2": pre["r2"],
                      "prefill_samples": pre["samples"],
                      "tokens_per_char": pre["mean_tokens_per_char"],
+                     "probe_reps": dec["probe_reps"],
                      "decode_tps": dec["R_out_tok_per_s"],
                      "p50_itl_ms": dec["p50_inter_chunk_gap_ms"],
                      "p90_itl_ms": dec["p90_inter_chunk_gap_ms"],
