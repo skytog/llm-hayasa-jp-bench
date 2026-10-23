@@ -148,7 +148,7 @@ def aggregate(records, duration, level, mode, slo_ttft, slo_lat):
     inw = [r for r in ok if r.get("completed_by_deadline")]
     ttfts = [r["ttft"] for r in inw if r["ttft"] is not None]
     lats = [r["latency"] for r in inw if r["latency"] is not None]
-    waits = [r["wait_s"] for r in inw if r.get("wait_s")]
+    waits = [r["wait_s"] for r in inw if r.get("wait_s") is not None]
     tokens = sum(r["completion_tokens"] or 0 for r in inw)
     slo_ok = [r for r in inw if (r["ttft"] or 1e9) <= slo_ttft and (r["latency"] or 1e9) <= slo_lat]
     return {
@@ -190,6 +190,8 @@ def main():
     ap.add_argument("--slo-latency", type=float, default=6.0)
     ap.add_argument("--timeout", type=float, default=180)
     ap.add_argument("--max-inflight", type=int, default=10)
+    ap.add_argument("--gap", type=float, default=20,
+                    help="水準間の idle gap 秒（前の水準の余熱・backlog を抜く）")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -202,7 +204,11 @@ def main():
               else [float(x) for x in args.rate.split(",")])
 
     rows = []
-    for lv in levels:
+    for i, lv in enumerate(levels):
+        if i > 0 and args.gap > 0:
+            print(f"  idle gap {args.gap:.0f}s...", flush=True)
+            time.sleep(args.gap)
+            chat_stream(args.base_url, args.model, "1+1は?", 8, 0.0, timeout=120)
         print(f"  {args.mode} {lv} ({args.duration:.0f}s)...", flush=True)
         if args.mode == "closed":
             row = run_closed(args.base_url, args.model, lv, args.duration,
