@@ -31,6 +31,8 @@ import requests
 from tasks import TASKS, TASK_BY_ID
 
 DEFAULT_BASE = "https://127.0.0.1:8000/v1"
+# 認証付きエンドポイント（OpenRouter 等）用。CLI の --api-key でも上書きできる
+_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY")
 
 
 # ------------------------------------------------------------------ HTTP
@@ -138,7 +140,8 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     state = "ok"
     for attempt in range(retry + 1):
         try:
-            with requests.post(url, json=body, stream=True,
+            headers = {"Authorization": f"Bearer {_API_KEY}"} if _API_KEY else {}
+            with requests.post(url, json=body, headers=headers, stream=True,
                                timeout=(10, min(30.0, max(1.0, timeout)))) as r:
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -161,7 +164,9 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
                             finish_reason = ch["finish_reason"]
                         d = ch.get("delta") or {}
                         piece = d.get("content")
-                        think = d.get("reasoning_content")
+                        # provider によって reasoning のフィールド名が違う
+                        # （vLLM/DeepSeek 直: reasoning_content / OpenRouter: reasoning）
+                        think = d.get("reasoning_content") or d.get("reasoning")
                         if piece or think:
                             now = time.perf_counter() - t0
                             if ttft_any is None:
@@ -667,6 +672,7 @@ def main():
     ap.add_argument("--no-speed", action="store_true")
     ap.add_argument("--no-warmup", action="store_true")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--api-key", default=None, help="Authorization: Bearer に使うキー")
     ap.add_argument("--sut-meta", action="append", default=[], metavar="K=V",
                     help="SUT のメタデータ（quantization=EXL3-4bpw, engine=vllm など）")
     ap.add_argument("--cache-mode", default="unknown", choices=["off", "on", "unknown"])
@@ -678,6 +684,9 @@ def main():
     ap.add_argument("--no-full-text", action="store_true",
                     help="生ログの回答全文・reasoning 全文を保存しない（既定は保存）")
     args = ap.parse_args()
+    if args.api_key:
+        global _API_KEY
+        _API_KEY = args.api_key
 
     models = [m.strip() for m in args.model.split(",") if m.strip()]
     task_ids = [t.strip() for t in args.tasks.split(",")] if args.tasks != "all" else [t["id"] for t in TASKS]
