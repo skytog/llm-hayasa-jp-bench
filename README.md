@@ -52,6 +52,12 @@ python3 bench.py --model X --no-speed
 | `summary_constraint` | 制約付き生成 | 60文字以内 + 必須キーワード2語 |
 | `classify_sentiment` | 分類 | ラベル一致 + score 閾値 |
 | `long_context_needle` | 長文抽出 | 約3,000字の文書中の3数値を JSON で抽出 |
+| `code_csv_parser` | コード実装（難） | クォート・`""` エスケープ・クォート内改行に対応した CSV パーサ |
+| `code_bugfix_merge_intervals` | バグ修正（難） | 接する区間のマージ漏れ＋入力を破壊するバグを修正 |
+| `code_kanji_number` | コード実装（難） | 漢数字（位取り・万億・先頭の一の省略）を整数化 |
+| `reconcile_invoices` | 複数文書突合（難） | 請求書と入金明細（取消行あり）から請求総額・入金総額・未入金残高 |
+| `table_extract_filter` | 表抽出（難） | Markdown 表からプラス部署のみ抽出し売上降順の JSON 配列 |
+| `business_days` | 日付計算（難） | 2026年4月の営業日数（土日＋祝日除外） |
 
 採点は PASS/FAIL のみ。5段階評価が必要になったら `grader` を差し替える。
 
