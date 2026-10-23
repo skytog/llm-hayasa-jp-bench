@@ -6,13 +6,20 @@
 
 | 指標 | 意味 | 実装 |
 |---|---|---|
-| **Prefill** | 入力処理速度 (tok/s) | プロンプト長を 3 段階変えて TTFT を測り、`TTFT = a + b × prompt_tokens` を最小二乗フィット。`1/b` を prefill tok/s、`a` を固定オーバーヘッド（ネットワーク往復＋キュー待ち）として分離する |
-| **Decode** | 出力生成速度 (tok/s) | ストリーミングのチャンク到着時刻からトークン間隔（ITL）を算出。平均・p50・p90 を出す |
+| **Prefill** | 実効入力長傾きの逆数 (tok/s) | プロンプト長を 3 段階変えて TTFT を測り、`TTFT = a + b × prompt_tokens` を最小二乗フィット。`1/b` を prefill tok/s、`a` を固定オーバーヘッド（ネットワーク往復＋キュー待ち）として分離する |
+| **Decode** | クライアント観測出力レート (tok/s) | ストリーミングのチャンク到着時刻からトークン間隔（ITL）を算出。平均・p50・p90 を出す |
 | **Task Completion Time** | 実タスクの wall time | 固定日本語タスク 8 本を N 回実行し、リクエスト開始から完了までの実時間を測る |
 | **Task Success Rate** | タスク成功率 | PASS/FAIL の二値。コードは実際にサブプロセスでテスト実行、抽出/分類は期待値比較、数値は許容誤差付き照合 |
-| **Time-to-Pass** | 成功1件を得るまでの期待時間 | `平均Task完了時間 ÷ 成功率` |
+| **TTP** | 観測消費時間あたりの成功 | `全試行時間総和 ÷ 成功数` |
 
-Prefill / Decode は「素の推論性能」、Task Time / Success Rate / Time-to-Pass は「実用性能」として分けて読む。
+Prefill / Decode は「素の推論性能」、Task Time / Success Rate / TTP は「実用性能」として分けて読む。
+
+**指標の厳密な定義・仮定・観測契約は `specs/` を参照**（実装より仕様が上位）:
+
+- `specs/metrics.md` — 指標の形式定義（TTFT_any / TTFT_answer、傾き法、R_out と inter-chunk gap の区別、TTP、goodput、日本語 fertility）
+- `specs/protocol.md` — シナリオ・warm/cold・cache・反復・timeout/retry・manifest・生データ
+- `specs/scoring.md` — 採点契約（strict schema / 最終行のみ / NaN拒否 / sentinel偽装対策 / 状態分類）
+- `specs/result-schema.json` — 結果 JSON スキーマ
 
 ## 使い方
 
@@ -40,7 +47,7 @@ python3 bench.py --model X --no-speed
 
 出力は `results.json`（生データ全部）と `report.md`（Markdown 表）。標準出力にも同じ表が出る。
 
-## タスク一覧（8本）
+## タスク一覧（14本）
 
 | id | 種類 | 判定方法 |
 |---|---|---|
@@ -59,7 +66,7 @@ python3 bench.py --model X --no-speed
 | `table_extract_filter` | 表抽出（難） | Markdown 表からプラス部署のみ抽出し売上降順の JSON 配列 |
 | `business_days` | 日付計算（難） | 2026年4月の営業日数（土日＋祝日除外） |
 
-採点は PASS/FAIL のみ。5段階評価が必要になったら `grader` を差し替える。
+採点は PASS/FAIL のみだが、失敗は状態分類する（`wrong_answer` / `format_violation` / `budget_exhausted` / `empty` / `http_error` / `timeout` / `truncated` / `grader_error`）。`grader_error` が出た run は `degraded` として成功率の解釈から外す。
 
 ## 注意点
 
@@ -77,5 +84,5 @@ LLM を介さず、正解コード/不正解コードを流し込んで grader �
 
 ```bash
 python3 test_graders.py
-# 8/8 OK なら "ALL GOOD"
+# GOOD/BAD 14組 + 偽陽性の反例11件がすべて期待通りなら "ALL GOOD"、終了コード0
 ```

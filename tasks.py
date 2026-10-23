@@ -6,6 +6,7 @@
 採点方針: PASS/FAIL の二値。細かい段階評価はしない。
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -42,7 +43,10 @@ def _extract_json(text: str) -> dict | None:
     if i < 0 or j <= i:
         return None
     try:
-        return json.loads(body[i:j + 1])
+        # Python の json は既定で NaN / Infinity を受理するため明示的に拒否する
+        def _reject(x):
+            raise ValueError(f"non-finite constant: {x}")
+        return json.loads(body[i:j + 1], parse_constant=_reject)
     except Exception:
         return None
 
@@ -67,16 +71,38 @@ def _norm(s: str) -> str:
 
 
 def _run_code(code: str, tests: str, timeout: int = 30) -> tuple[bool, str]:
+    """候補コードを別プロセスで実行する（specs/scoring.md §2.1）。
+
+    sentinel 偽装対策: ハーネス側がランダム nonce を生成し、テスト完了後に
+    `ALL_PASS:<nonce>` を出す。候補は nonce を知らないので
+    `print("ALL_PASS")` や `os._exit(0)` だけでは通らない。
+    完全な隔離（network/secrets/read-only host/資源制限）は P1 の sandbox 要件。
+    """
+    import uuid
+
+    nonce = uuid.uuid4().hex
     with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "sol.py")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(code + "\n\n" + tests)
+        sol = os.path.join(d, "sol.py")
+        runner = os.path.join(d, "run_tests.py")
+        with open(sol, "w", encoding="utf-8") as f:
+            f.write(code + "\n")
+        with open(runner, "w", encoding="utf-8") as f:
+            f.write(
+                "import sys\n"
+                "sys.path.insert(0, '.')\n"
+                "import sol\n"
+                "from sol import *\n"
+                + tests
+                + f"\nprint('ALL_PASS:{nonce}')\n"
+            )
+        env = {"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"}
         try:
-            r = subprocess.run([sys.executable, path], capture_output=True,
-                               text=True, timeout=timeout, cwd=d)
+            r = subprocess.run([sys.executable, "-I", runner], capture_output=True,
+                               text=True, timeout=timeout, cwd=d, env=env)
         except subprocess.TimeoutExpired:
             return False, "timeout"
-        if r.returncode == 0 and "ALL_PASS" in r.stdout:
+        marker = f"ALL_PASS:{nonce}"
+        if r.returncode == 0 and marker in r.stdout:
             return True, "ok"
         err = (r.stderr or r.stdout).strip().splitlines()
         return False, " | ".join(err[-3:])[:300]
@@ -216,13 +242,13 @@ def grade_extract_emp(text, meta):
         bad.append(f"氏名={d.get('氏名')!r}")
     if _norm(d.get("部署", "")) != exp["部署"]:
         bad.append(f"部署={d.get('部署')!r}")
-    if str(d.get("入社年")) != "2018":
+    if not (isinstance(d.get("入社年"), int) and not isinstance(d.get("入社年"), bool)
+            and d["入社年"] == exp["入社年"]):
         bad.append(f"入社年={d.get('入社年')!r}")
-    try:
-        if abs(float(d.get("年収")) - 6200000) > 1:
-            bad.append(f"年収={d.get('年収')!r}")
-    except Exception:
-        bad.append(f"年収={d.get('年収')!r}")
+    v = d.get("年収")
+    if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            and float(v) == exp["年収"]):
+        bad.append(f"年収={v!r}")
     return (not bad), ("ok" if not bad else "; ".join(bad))
 
 
@@ -241,21 +267,22 @@ Aさんは毎月の手取り28万円のうち35%を貯金している。年間�
 
 
 def grade_numeric(text, meta):
+    """最終行の `答え: <整数>` のみを見る（specs/scoring.md §2.3）。"""
     exp = T_NUMERIC["expected"]
-    m = re.search(r"答え[:：]\s*([0-9,０-９.,]+)\s*(万|億)?", text)
-    cands = []
-    if m:
-        v = float(m.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789")).replace(",", ""))
-        if m.group(2) == "万":
-            v *= 1e4
-        elif m.group(2) == "億":
-            v *= 1e8
-        cands.append(v)
-    cands += _nums(text)
-    for v in cands:
-        if abs(v - exp) <= 1:
-            return True, "ok"
-    return False, f"no match (expected {exp}); tail={text.strip().splitlines()[-1][:80]!r}"
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return False, "empty"
+    m = re.match(r"答え[:：]\s*([0-9０-９,]+)\s*(万|億)?\s*$", lines[-1])
+    if not m:
+        return False, f"最終行に答えが無い: {lines[-1][:80]!r}"
+    v = float(m.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789")).replace(",", ""))
+    if m.group(2) == "万":
+        v *= 1e4
+    elif m.group(2) == "億":
+        v *= 1e8
+    if abs(v - exp) <= 0.5:
+        return True, "ok"
+    return False, f"got {v:g} (expected {exp})"
 
 
 # --- 6. 制約付き要約
@@ -271,6 +298,7 @@ T_SUMMARY = {
 
 
 def grade_summary(text, meta):
+    """字数とキーワードのみを見る = 制約通過率（意味品質ではない）。"""
     body = text.strip().replace("\n", "")
     # 見出しっぽい前置きを除去
     body = re.sub(r"^(要約[:：]|以下は要約です[。:]?)", "", body).strip()
@@ -309,12 +337,11 @@ def grade_sentiment(text, meta):
     if d is None:
         return False, "invalid json"
     s = str(d.get("sentiment", "")).strip().lower()
-    try:
-        score = int(d.get("score"))
-    except Exception:
-        return False, f"score invalid: {d.get('score')!r}"
+    score = d.get("score")
     if s != "positive":
         return False, f"sentiment={s!r}"
+    if not (isinstance(score, int) and not isinstance(score, bool) and 1 <= score <= 5):
+        return False, f"score={score!r} (1..5の整数が必要)"
     if score < 4:
         return False, f"score={score}"
     return True, "ok"
@@ -364,13 +391,9 @@ def grade_longctx(text, meta):
     exp = T_LONGCTX["expected"]
     bad = []
     for k, v in exp.items():
-        try:
-            got = float(str(d.get(k, "")).translate(str.maketrans("０１２３４５６７８９", "0123456789")).replace(",", "").replace("円", ""))
-        except Exception:
-            bad.append(f"{k}={d.get(k)!r}")
-            continue
-        if abs(got - v) > 1:
-            bad.append(f"{k}={got}")
+        got = d.get(k)
+        if not (isinstance(got, int) and not isinstance(got, bool) and got == v):
+            bad.append(f"{k}={got!r}")
     return (not bad), ("ok" if not bad else "; ".join(bad))
 
 
@@ -444,9 +467,9 @@ assert norm(merge_intervals([[1, 3], [2, 6], [8, 10], [15, 18]])) == [[1, 6], [8
 assert norm(merge_intervals([[1, 4], [4, 5]])) == [[1, 5]]
 assert norm(merge_intervals([[5, 6], [1, 2]])) == [[1, 2], [5, 6]]
 assert norm(merge_intervals([])) == []
-src = [[1, 3]]
+src = [[8, 10], [1, 3], [2, 6]]
 merge_intervals(src)
-assert src == [[1, 3]], "入力リストが変更されている"
+assert src == [[8, 10], [1, 3], [2, 6]], "入力リストが変更されている"
 assert norm(merge_intervals([[1, 10], [2, 3]])) == [[1, 10]]
 print("ALL_PASS")
 """,
@@ -529,13 +552,9 @@ def grade_reconcile(text, meta):
     exp = T_RECONCILE["expected"]
     bad = []
     for k, v in exp.items():
-        try:
-            got = float(str(d.get(k, "")).translate(str.maketrans("０１２３４５６７８９", "0123456789")).replace(",", "").replace("円", ""))
-        except Exception:
-            bad.append(f"{k}={d.get(k)!r}")
-            continue
-        if abs(got - v) > 1:
-            bad.append(f"{k}={got}")
+        got = d.get(k)
+        if not (isinstance(got, int) and not isinstance(got, bool) and got == v):
+            bad.append(f"{k}={got!r}")
     return (not bad), ("ok" if not bad else "; ".join(bad))
 
 
@@ -576,19 +595,22 @@ def grade_table(text, meta):
         got = json.loads(body[i:j + 1])
     except Exception as e:  # noqa: BLE001
         return False, f"json error: {e}"
+    if not isinstance(got, list):
+        return False, f"not a list: {type(got).__name__}"
     exp = T_TABLE["expected"]
     if len(got) != len(exp):
         return False, f"件数 {len(got)} != {len(exp)}"
     for g, e in zip(got, exp):
+        if not isinstance(g, dict):
+            return False, f"要素がobjectでない: {g!r}"
         if _norm(g.get("部署", "")) != e["部署"]:
             return False, f"部署 {g.get('部署')!r} (expected {e['部署']})"
-        try:
-            if abs(float(g.get("売上")) - e["売上"]) > 1:
-                return False, f"売上 {g.get('売上')!r}"
-            if abs(float(str(g.get("前年比")).replace("%", "").replace("+", "")) - e["前年比"]) > 0.05:
-                return False, f"前年比 {g.get('前年比')!r}"
-        except Exception:
-            return False, f"数値変換不可 {g}"
+        sv, pv = g.get("売上"), g.get("前年比")
+        if not (isinstance(sv, int) and not isinstance(sv, bool) and sv == e["売上"]):
+            return False, f"売上 {sv!r} (expected int {e['売上']})"
+        if not (isinstance(pv, (int, float)) and not isinstance(pv, bool) and math.isfinite(pv)
+                and abs(float(pv) - e["前年比"]) <= 0.05):
+            return False, f"前年比 {pv!r}"
     return True, "ok"
 
 
@@ -606,13 +628,16 @@ T_BUSINESS_DAYS = {
 
 
 def grade_business_days(text, meta):
-    m = re.search(r"答え[:：]\s*(\d+)", text)
-    if m and int(m.group(1)) == T_BUSINESS_DAYS["expected"]:
-        return True, "ok"
-    nums = _nums(text)
-    if nums and abs(nums[-1] - T_BUSINESS_DAYS["expected"]) <= 0.5:
-        return True, "ok (答え行なし)"
-    return False, f"expected 21; tail={text.strip().splitlines()[-1][:80]!r}"
+    """最終行の `答え: <整数>` のみを見る。"""
+    exp = T_BUSINESS_DAYS["expected"]
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return False, "empty"
+    m = re.match(r"答え[:：]\s*(\d+)\s*$", lines[-1])
+    if not m:
+        return False, f"最終行に整数の答えが無い: {lines[-1][:80]!r}"
+    got = int(m.group(1))
+    return (got == exp), (f"got {got} (expected {exp})" if got != exp else "ok")
 
 
 TASKS = [

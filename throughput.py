@@ -37,7 +37,7 @@ def _safe_chat(base, model, temperature):
         return chat_stream(base, model, PROMPT, MAX_TOKENS, temperature, 900)
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)[:160], "completion_tokens": 0, "ttft": None,
-                "total": 0.0, "decode_tps": None, "itls": []}
+                "total": 0.0, "R_out": None, "itls": []}
 
 
 def run_level(base, model, conc, temperature):
@@ -51,7 +51,7 @@ def run_level(base, model, conc, temperature):
     errors = [r for r in results if not r["completion_tokens"]]
     total_tokens = sum(r["completion_tokens"] for r in ok)
     ttfts = [r["ttft"] for r in ok if r["ttft"]]
-    decodes = [r["decode_tps"] for r in ok if r["decode_tps"]]
+    decodes = [r["R_out"] for r in ok if r.get("R_out")]
     totals = [r["total"] for r in ok]
     return {
         "concurrency": conc,

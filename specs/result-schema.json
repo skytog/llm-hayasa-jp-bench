@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/skytog/llm-bench-ja/specs/result-schema.json",
+  "title": "llm-bench-ja result",
+  "description": "1 run 分の結果。生データ（attempt 単位）と集計を含む。指標定義は specs/metrics.md に従う。",
+  "type": "object",
+  "required": ["schema_version", "run_id", "sut", "protocol", "dataset", "grader", "attempts", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "0.1" },
+    "run_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}$" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "sut": {
+      "type": "object",
+      "required": ["name", "engine", "gpu", "sampling"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "model_revision": { "type": ["string", "null"] },
+        "quantization": { "type": ["string", "null"] },
+        "tokenizer_hash": { "type": ["string", "null"] },
+        "chat_template_hash": { "type": ["string", "null"] },
+        "engine": {
+          "type": "object",
+          "required": ["name", "version"],
+          "properties": {
+            "name": { "type": "string" },
+            "version": { "type": "string" },
+            "args": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "gpu": {
+          "type": "object",
+          "required": ["type", "count"],
+          "properties": {
+            "type": { "type": "string" },
+            "count": { "type": "integer", "minimum": 1 },
+            "driver": { "type": ["string", "null"] }
+          }
+        },
+        "parallelism": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "speculative": { "type": ["object", "null"] },
+        "sampling": {
+          "type": "object",
+          "required": ["temperature"],
+          "properties": {
+            "temperature": { "type": "number" },
+            "top_p": { "type": ["number", "null"] },
+            "seed": { "type": ["integer", "null"] }
+          }
+        },
+        "cache": {
+          "type": "object",
+          "properties": { "mode": { "enum": ["off", "on", "unknown"] } }
+        },
+        "context_limit": { "type": ["integer", "null"] }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "required": ["scenario", "repetitions", "timeout_s", "retry"],
+      "properties": {
+        "scenario": { "enum": ["S1", "S2", "S3"] },
+        "concurrency": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "timeout_s": { "type": "number", "exclusiveMinimum": 0 },
+        "retry": { "enum": ["off", "on"] },
+        "max_tokens_policy": { "type": "string" },
+        "seed": { "type": ["integer", "null"] }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["name", "hash", "task_count"],
+      "properties": {
+        "name": { "type": "string" },
+        "hash": { "type": "string" },
+        "task_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "grader": {
+      "type": "object",
+      "required": ["version", "contract"],
+      "properties": {
+        "version": { "type": "string" },
+        "contract": { "type": "string" }
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_id", "run", "state", "passed"],
+        "properties": {
+          "task_id": { "type": "string" },
+          "run": { "type": "integer", "minimum": 0 },
+          "state": {
+            "enum": ["pass", "wrong_answer", "format_violation", "budget_exhausted",
+                     "empty", "http_error", "timeout", "truncated", "grader_error"]
+          },
+          "passed": { "type": "boolean" },
+          "detail": { "type": ["string", "null"] },
+          "s": { "type": ["number", "null"] },
+          "f_any": { "type": ["number", "null"] },
+          "f_answer": { "type": ["number", "null"] },
+          "l": { "type": ["number", "null"] },
+          "e": { "type": ["number", "null"] },
+          "T_s": { "type": ["number", "null"] },
+          "N": { "type": ["integer", "null"] },
+          "C": { "type": ["integer", "null"] },
+          "C_vis": { "type": ["integer", "null"] },
+          "finish_reason": { "type": ["string", "null"] },
+          "output": { "type": ["string", "null"] },
+          "grader_error": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "speed": {
+      "type": ["object", "null"],
+      "properties": {
+        "prefill": {
+          "type": "object",
+          "properties": {
+            "beta_tok_per_s": { "type": ["number", "null"] },
+            "P_eff_tok_per_s": { "type": ["number", "null"] },
+            "beta_ci95": { "type": ["array", "null"], "items": { "type": "number" } },
+            "r2": { "type": ["number", "null"] },
+            "samples": { "type": "array" },
+            "cache_mode": { "enum": ["off", "on", "unknown"] }
+          }
+        },
+        "decode": {
+          "type": "object",
+          "properties": {
+            "R_out_tok_per_s": { "type": ["number", "null"] },
+            "inter_chunk_gap_ms": {
+              "type": "object",
+              "properties": {
+                "p50": { "type": ["number", "null"] },
+                "p90": { "type": ["number", "null"] },
+                "p99": { "type": ["number", "null"] }
+              }
+            },
+            "tokens_per_chunk": { "type": ["number", "null"] },
+            "ttft_any_s": { "type": ["number", "null"] },
+            "ttft_answer_s": { "type": ["number", "null"] }
+          }
+        },
+        "cold_start_ttft_s": { "type": ["number", "null"] }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["attempts_total", "passes", "success_rate_all", "quality_rate"],
+      "properties": {
+        "attempts_total": { "type": "integer", "minimum": 0 },
+        "passes": { "type": "integer", "minimum": 0 },
+        "grader_errors": { "type": "integer", "minimum": 0 },
+        "success_rate_all": { "type": "number" },
+        "quality_rate": { "type": ["number", "null"] },
+        "mean_task_time_s": { "type": ["number", "null"] },
+        "ttp_obs_s": { "type": ["number", "null"] },
+        "degraded": { "type": "boolean" }
+      }
+    }
+  }
+}

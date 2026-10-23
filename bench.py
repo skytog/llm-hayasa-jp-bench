@@ -33,12 +33,13 @@ DEFAULT_BASE = "https://127.0.0.1:8000/v1"
 
 
 def _sse_events(resp):
-    """SSE のイベント境界（空行）で区切って返す。行分割で JSON が壊れるのを防ぐ。"""
+    """SSE のイベント境界（空行）で区切って返す。CRLF も扱う。"""
     buf = b""
     for chunk in resp.iter_content(chunk_size=8192):
         if not chunk:
             continue
         buf += chunk
+        buf = buf.replace(b"\r\n", b"\n")
         while b"\n\n" in buf:
             event, buf = buf.split(b"\n\n", 1)
             yield event.decode("utf-8", "replace")
@@ -60,8 +61,12 @@ def _parse_event(event: str):
             return None
 
 
-def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600):
-    """1リクエストをストリーミングで実行し、計測値を返す。"""
+def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, retry=0):
+    """1リクエストをストリーミングで実行し、観測契約（specs/metrics.md §1）に沿った値を返す。
+
+    失敗しても elapsed（失敗確定までの時間）を必ず返す。
+    state: ok / empty / truncated / http_error / timeout / error
+    """
     url = base.rstrip("/") + "/chat/completions"
     body = {
         "model": model,
@@ -72,67 +77,95 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600):
         "stream_options": {"include_usage": True},
     }
     t0 = time.perf_counter()
-    ttft = None
+    ttft_any = None
+    ttft_answer = None
     chunk_times = []
     content_parts = []
     reasoning_parts = []
     usage = {}
+    finish_reason = None
+    done_seen = False
+    parse_errors = 0
     last_err = None
-    for attempt in range(2):
+    state = "ok"
+    for attempt in range(retry + 1):
         try:
             with requests.post(url, json=body, stream=True, timeout=timeout) as r:
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
                 for event in _sse_events(r):
+                    if "[DONE]" in event:
+                        done_seen = True
+                        continue
                     obj = _parse_event(event)
                     if obj is None:
+                        parse_errors += 1
                         continue
                     if obj.get("usage"):
                         usage = obj["usage"]
                     for ch in obj.get("choices") or []:
+                        if ch.get("finish_reason"):
+                            finish_reason = ch["finish_reason"]
                         d = ch.get("delta") or {}
                         piece = d.get("content")
                         think = d.get("reasoning_content")
                         if piece or think:
-                            now = time.perf_counter()
-                            if ttft is None:
-                                ttft = now - t0
-                            chunk_times.append(now - t0)
+                            now = time.perf_counter() - t0
+                            if ttft_any is None:
+                                ttft_any = now
+                            if piece and ttft_answer is None:
+                                ttft_answer = now
+                            chunk_times.append(now)
                             if piece:
                                 content_parts.append(piece)
                             if think:
                                 reasoning_parts.append(think)
             break
+        except requests.exceptions.Timeout as e:  # noqa: BLE001
+            last_err = e
+            state = "timeout"
         except Exception as e:  # noqa: BLE001
             last_err = e
-            if attempt == 1:
-                raise
-            t0 = time.perf_counter()
-            ttft, chunk_times, content_parts, reasoning_parts, usage = None, [], [], [], {}
+            state = "http_error" if "HTTP" in str(e) else "error"
+        if attempt < retry:
+            time.sleep(1)
 
     total = time.perf_counter() - t0
     content = "".join(content_parts)
     reasoning = "".join(reasoning_parts)
     # 採点は最終回答(content)のみ。reasoning 内のコードで偶然通るのを防ぐ
     text = content
-    completion = usage.get("completion_tokens") or len(chunk_times)
+    completion = usage.get("completion_tokens")
     prompt_tokens = usage.get("prompt_tokens")
     itls = [b - a for a, b in zip(chunk_times, chunk_times[1:])]
-    decode_span = (chunk_times[-1] - chunk_times[0]) if len(chunk_times) > 1 else None
-    # チャンクには複数トークンがまとまって届くことがある（実測 4.3 tok/chunk）ため、
-    # チャンク数ではなく usage の completion_tokens で割る
-    decode_tps = ((completion - 1) / decode_span) if (decode_span and completion > 1) else None
+    span = (chunk_times[-1] - chunk_times[0]) if len(chunk_times) > 1 else None
+    # クライアント観測出力レート。usage が無い場合 C は不明で、チャンク数で代用しない
+    R_out = ((completion - 1) / span) if (span and completion and completion > 1) else None
+
+    if state == "ok":
+        if not (done_seen or finish_reason):
+            state = "truncated"
+        elif not content.strip():
+            state = "empty"
+
     return {
         "text": text,
         "content": content,
         "reasoning": reasoning,
-        "ttft": ttft,
+        "ttft": ttft_any,
+        "ttft_any": ttft_any,
+        "ttft_answer": ttft_answer,
+        "l": chunk_times[-1] if chunk_times else None,
         "total": total,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion,
         "itls": itls,
-        "decode_tps": decode_tps,
+        "R_out": R_out,
         "usage": usage,
+        "finish_reason": finish_reason,
+        "done_seen": done_seen,
+        "parse_errors": parse_errors,
+        "state": state,
         "error": str(last_err) if last_err else None,
     }
 
@@ -231,23 +264,22 @@ DECODE_TOKENS = 256
 
 def measure_decode(base, model, temperature=0.0):
     r = chat_stream(base, model, DECODE_PROMPT, max_tokens=DECODE_TOKENS, temperature=temperature)
-    if not r["itls"]:
-        raise RuntimeError(f"decode probe produced no tokens: {r['error']}")
+    if r["state"] != "ok":
+        raise RuntimeError(f"decode probe state={r['state']}: {r['error']}")
     itls = r["itls"]
-    p50 = statistics.median(itls)
-    p90 = sorted(itls)[int(len(itls) * 0.9) - 1] if len(itls) > 1 else itls[0]
-    span = r["total"] - r["ttft"] if r["ttft"] else None
     tokens = r["completion_tokens"]
+    gap_p50 = statistics.median(itls) if itls else None
+    gap_p90 = (sorted(itls)[int(len(itls) * 0.9) - 1] if len(itls) > 1 else (itls[0] if itls else None))
     return {
-        "decode_tps": r["decode_tps"],
-        "decode_tps_p50": (1 / p50) if p50 > 0 else None,
-        "p50_itl_ms": p50 * 1000,
-        "p90_itl_ms": p90 * 1000,
-        "token_itl_ms": (span / (tokens - 1) * 1000) if (span and tokens and tokens > 1) else None,
-        "tokens_per_chunk": round(tokens / len(itls), 2) if itls else None,
-        "ttft": r["ttft"],
+        "R_out_tok_per_s": r["R_out"],
+        "p50_inter_chunk_gap_ms": gap_p50 * 1000 if gap_p50 else None,
+        "p90_inter_chunk_gap_ms": gap_p90 * 1000 if gap_p90 else None,
+        "tokens_per_chunk": round(tokens / len(itls), 2) if (tokens and itls) else None,
+        "ttft_any_s": r["ttft_any"],
+        "ttft_answer_s": r["ttft_answer"],
         "completion_tokens": tokens,
         "itl_samples": len(itls),
+        "state": r["state"],
     }
 
 
@@ -265,27 +297,41 @@ def run_tasks(base, model, task_ids, runs, temperature):
                                 max_tokens=task.get("max_tokens", 1024),
                                 temperature=temperature, timeout=900)
             except Exception as e:  # noqa: BLE001
-                results.append({"task": tid, "run": i, "passed": False, "elapsed": None,
-                                "error": str(e)[:300]})
+                elapsed = time.perf_counter() - t_start
+                results.append({"task": tid, "run": i, "passed": False, "state": "error",
+                                "elapsed": round(elapsed, 3), "detail": str(e)[:300]})
+                print(f"    {tid} run{i}: ERROR {elapsed:.1f}s ({str(e)[:60]})", flush=True)
                 continue
-            elapsed = time.perf_counter() - t_start
-            if not r["content"].strip():
-                passed, detail = False, f"最終回答なし（reasoning {r['completion_tokens']} tok で max_tokens 到達）"
+            elapsed = r["total"]
+            state = r["state"]
+            if state != "ok":
+                passed, detail = False, f"state={state} finish={r['finish_reason']} err={str(r['error'])[:120]}"
+            elif not r["content"].strip():
+                passed, detail = False, "empty content"
+                if r["finish_reason"] == "length":
+                    state = "budget_exhausted"
             else:
-                passed, detail = task["grader"](r["text"], r)
+                try:
+                    passed, detail = task["grader"](r["text"], r)
+                    state = "pass" if passed else "wrong_answer"
+                except Exception as e:  # noqa: BLE001
+                    passed, detail, state = False, f"grader_error: {e}", "grader_error"
             results.append({
                 "task": tid,
                 "run": i,
                 "passed": bool(passed),
+                "state": state,
                 "detail": detail,
                 "elapsed": round(elapsed, 3),
-                "ttft": round(r["ttft"], 3) if r["ttft"] else None,
+                "ttft_any": round(r["ttft_any"], 3) if r["ttft_any"] else None,
+                "ttft_answer": round(r["ttft_answer"], 3) if r["ttft_answer"] else None,
                 "prompt_tokens": r["prompt_tokens"],
                 "completion_tokens": r["completion_tokens"],
-                "output": r["text"][:1200],
+                "finish_reason": r["finish_reason"],
+                "output": r["text"][:4000],
             })
-            print(f"    {tid} run{i}: {'PASS' if passed else 'FAIL'} {elapsed:.1f}s "
-                  f"({detail[:60]})", flush=True)
+            print(f"    {tid} run{i}: {state.upper()} {elapsed:.1f}s "
+                  f"({str(detail)[:60]})", flush=True)
     return results
 
 
@@ -298,7 +344,7 @@ def summarize(model, speed, task_results):
         by_task.setdefault(r["task"], []).append(r)
     per_task = []
     for tid, rs in by_task.items():
-        times = [r["elapsed"] for r in rs if r["elapsed"]]
+        times = [r["elapsed"] for r in rs if r["elapsed"] is not None]
         passes = sum(1 for r in rs if r["passed"])
         per_task.append({
             "task": tid,
@@ -308,10 +354,20 @@ def summarize(model, speed, task_results):
         })
     total_runs = len(task_results)
     passes = sum(1 for r in task_results if r["passed"])
-    times = [r["elapsed"] for r in task_results if r["elapsed"]]
+    # 失敗も含めた全試行の時間（欠測にしない）
+    times = [r["elapsed"] for r in task_results if r["elapsed"] is not None]
     success_rate = passes / total_runs if total_runs else 0
+    # 正常応答に限定した品質（信頼性エラーを分母から除く）
+    quality_states = {"pass", "wrong_answer", "format_violation", "budget_exhausted", "empty"}
+    quality_denom = sum(1 for r in task_results if r.get("state") in quality_states)
+    quality_rate = (passes / quality_denom) if quality_denom else None
+    grader_errors = sum(1 for r in task_results if r.get("state") == "grader_error")
     mean_time = statistics.mean(times) if times else None
-    ttp = (mean_time / success_rate) if (mean_time and success_rate > 0) else None
+    # 観測消費時間あたりの成功（specs/metrics.md §5）
+    ttp = (sum(times) / passes) if (times and passes > 0) else None
+    states = {}
+    for r in task_results:
+        states[r.get("state", "unknown")] = states.get(r.get("state", "unknown"), 0) + 1
     return {
         "model": model,
         "speed": speed,
@@ -321,8 +377,12 @@ def summarize(model, speed, task_results):
             "task_runs": total_runs,
             "task_passes": passes,
             "success_rate": round(success_rate, 4),
+            "quality_rate": round(quality_rate, 4) if quality_rate is not None else None,
+            "grader_errors": grader_errors,
+            "degraded": grader_errors > 0,
             "mean_task_time_s": round(mean_time, 2) if mean_time else None,
             "time_to_pass_s": round(ttp, 2) if ttp else None,
+            "states": states,
         },
     }
 
@@ -342,11 +402,16 @@ def markdown(results):
         lines += [f"## {res['model']}", "",
                   "| 指標 | 値 |", "|---|---|",
                   f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s (傾き法, R²={fmt(s.get('r2'), 3)}) |",
-                  f"| Decode | {fmt(s.get('decode_tps'), 1)} tok/s (p50 ITL {fmt(s.get('p50_itl_ms'), 1)} ms) |",
-                  f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (平均, {sm['task_runs']}回) |",
-                  f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']}) |",
-                  f"| Time-to-Pass | {fmt(sm.get('time_to_pass_s'), 1)} s |",
+                  f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s (p50 inter-chunk gap {fmt(s.get('p50_itl_ms'), 1)} ms) |",
+                  f"| Task Time | {fmt(sm.get('mean_task_time_s'), 1)} s (全試行平均, {sm['task_runs']}回) |",
+                  f"| Success Rate | {sm['success_rate'] * 100:.0f}% ({sm['task_passes']}/{sm['task_runs']})"
+                  + (f" / 正常応答内 {sm['quality_rate'] * 100:.0f}%" if sm.get("quality_rate") is not None else "") + " |",
+                  f"| TTP (観測時間/成功) | {fmt(sm.get('time_to_pass_s'), 1)} s |",
                   ""]
+        if sm.get("degraded"):
+            lines.append(f"- **degraded**: grader_error {sm['grader_errors']}件（測定不能）")
+        if sm.get("states"):
+            lines.append("- 状態: " + ", ".join(f"{k}={v}" for k, v in sorted(sm["states"].items())))
         if s.get("cold_start_ttft_s") is not None:
             lines.append(f"- コールドスタートTTFT（初回モデルロード込み）: {fmt(s['cold_start_ttft_s'], 1)} s")
         if s.get("intercept_s") is not None:
@@ -421,10 +486,10 @@ def main():
                      "intercept_s": pre["intercept_s"],
                      "r2": pre["r2"],
                      "prefill_samples": pre["samples"],
-                     "decode_tps": dec["decode_tps"],
-                     "decode_tps_p50": dec["decode_tps_p50"],
-                     "p50_itl_ms": dec["p50_itl_ms"],
-                     "p90_itl_ms": dec["p90_itl_ms"],
+                     "decode_tps": dec["R_out_tok_per_s"],
+                     "p50_itl_ms": dec["p50_inter_chunk_gap_ms"],
+                     "p90_itl_ms": dec["p90_inter_chunk_gap_ms"],
+                     "tokens_per_chunk": dec["tokens_per_chunk"],
                      "cold_start_ttft_s": cold}
 
         print(f"  tasks: {len(task_ids)} x {args.runs} runs", flush=True)

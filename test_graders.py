@@ -1,4 +1,6 @@
 """採点ロジックの自己テスト（LLMを介さず正解/不正解を流し込む）."""
+import sys
+
 from tasks import TASK_BY_ID
 
 GOOD = {
@@ -191,4 +193,55 @@ for tid, task in TASK_BY_ID.items():
         ok = False
     print(f"{status}{tid:24s} good={p} bad={q}  ({d[:40]} / {e[:40]})")
 
+# 偽陽性の反例（specs/scoring.md §4）。すべて FAIL し、例外を投げてはいけない
+COUNTEREXAMPLES = [
+    ("code_count_words", 'import os; print("ALL_PASS", flush=True); os._exit(0)', "sentinel偽装"),
+    ("code_bugfix_merge_intervals", """
+```python
+def merge_intervals(intervals):
+    intervals.sort()
+    out = []
+    for s, e in intervals:
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+```
+""", "入力破壊"),
+    ("numeric_multi_step", "途中の候補は1596000。しかし答え: 0", "誤った結論"),
+    ("numeric_multi_step", "", "空入力"),
+    ("extract_employee_json", '{"氏名":"佐藤 健一","部署":"生産管理部","入社年":2018,"年収":NaN}', "NaN"),
+    ("classify_sentiment", '{"sentiment":"positive","score":999}', "範囲外score"),
+    ("long_context_needle", '{"売上高":1248000000,"従業員数":343,"拠点数":18}', "整数2値誤り"),
+    ("business_days", "答え: 21\n訂正、答え: 22", "答えが複数"),
+    ("business_days", "答え: 21.9", "小数"),
+    ("table_extract_filter", "[1,2,3,4]", "要素がobjectでない"),
+    ("reconcile_invoices", '{"請求総額":269500,"入金総額":249500,"未入金残高":NaN}', "NaN"),
+]
+
+# 仕様上の既知の限界（FAIL しないことが正しい）。summary は「制約通過率」であって
+# 意味品質ではないため、原文と逆の意味でも字数とキーワードを満たせば通る。
+KNOWN_LIMITATIONS = [
+    ("summary_constraint", "クラウド移行でコストは増大し、削減は一切なかった。",
+     "制約通過のみ（意味品質は未実装）"),
+]
+
+print("\n--- 偽陽性の反例（FAIL すべき） ---")
+for tid, text, label in COUNTEREXAMPLES:
+    try:
+        passed, detail = TASK_BY_ID[tid]["grader"](text, {})
+    except Exception as exc:  # noqa: BLE001
+        passed, detail = "EXC", f"{type(exc).__name__}: {exc}"
+    good = (passed is False)
+    if not good:
+        ok = False
+    print(f"{'OK ' if good else 'NG '}{tid:24s} {label:16s} -> {passed} ({str(detail)[:50]})")
+
+print("\n--- 既知の限界（通ることが正しい） ---")
+for tid, text, label in KNOWN_LIMITATIONS:
+    passed, detail = TASK_BY_ID[tid]["grader"](text, {})
+    print(f"    {tid:24s} {label:24s} -> passed={passed}")
+
 print("\nALL GOOD" if ok else "\nGRADER BUG")
+sys.exit(0 if ok else 1)
