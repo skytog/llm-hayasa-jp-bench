@@ -90,7 +90,7 @@ python3 steady.py --model X --mode open --rate 0.1,0.2,0.3 --duration 60
 
 主なオプションは次のとおり。
 
-- `--base-url`（既定: `LLM_BASE_URL` → PGX の Tailscale エンドポイント）
+- `--base-url`（既定: 環境変数 `LLM_BASE_URL`、無ければ `http://127.0.0.1:8000/v1`）
 - `--runs`（既定 3）/ `--tasks`（`all` またはカンマ区切り）
 - `--temperature`（既定 0.0）
 - `--prefill-lengths`（既定 `500,2000,8000` 文字）

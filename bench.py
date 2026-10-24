@@ -33,7 +33,7 @@ import requests
 
 from tasks import TASKS, TASK_BY_ID
 
-DEFAULT_BASE = "https://127.0.0.1:8000/v1"
+DEFAULT_BASE = "http://127.0.0.1:8000/v1"
 # 認証付きエンドポイント（OpenRouter 等）用。CLI の --api-key でも上書きできる
 _API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY")
 
