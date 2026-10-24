@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/skytog/llm-bench-ja/specs/result-schema.json",
-  "title": "llm-bench-ja artifacts",
+  "$id": "https://github.com/skytog/llm-hayasa-jp-bench/specs/result-schema.json",
+  "title": "llm-hayasa-jp-bench artifacts",
   "description": "results.json（run の配列）, manifest_<SUT>.json, attempts.jsonl の1行 を記述する。指標定義は specs/metrics.md。",
   "$defs": {
     "attempt": {
