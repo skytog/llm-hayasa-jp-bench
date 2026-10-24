@@ -144,6 +144,15 @@ python3 steady.py --model X --mode open --rate 0.1,0.2,0.3 --duration 60
 - temp 0 でも決定論的でない（同じ2問×3回で 2 fail / 1 pass）。ローカル llama-swap は reasoning 文字数まで一致する
 - reasoning のフィールド名が違う（vLLM/DeepSeek 直は `reasoning_content`、OpenRouter は `reasoning`）。実装は両対応
 
+## ライセンス
+
+MIT（`LICENSE`）。同梱のコード・プロンプト・仕様・結果はすべて本リポジトリで作成したもので、
+第三者コードの混入はない（`grep` で Copyright/SPDX 表記なしを確認）。
+
+- 依存: Python 標準ライブラリ＋`requests`（Apache-2.0、寛容ライセンス）
+- 実行時に `python:3.12-slim` コンテナを使う（PSF ライセンス。同梱はしていない）
+- 測定対象のモデル重み・tokenizer・engine は同梱していない（各 SUT のライセンスに従う）
+
 ## 採点ロジックの自己テスト
 
 ```bash
