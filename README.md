@@ -1,4 +1,6 @@
-# llm-bench-ja
+# llm-hayasa-jp-bench
+
+**日本語 LLM の速さを測る** — prefill / decode / タスク完了時間を、クライアント観測で再現可能に記録する実験用ハーネス。
 
 日本語で記述した固定 workload を OpenAI 互換 API（`/v1/chat/completions`）に投げ、
 **クライアント側で観測できる速度とタスク終結時間**を記録する実験用ハーネス。
