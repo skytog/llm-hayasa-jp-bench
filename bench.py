@@ -203,7 +203,9 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     span = (chunk_times[-1] - chunk_times[0]) if len(chunk_times) > 1 else None
     # content 区間だけの速度（reasoning の時間を含めない = 純粋な日本語生成の速さ）
     content_span = (content_times[-1] - content_times[0]) if len(content_times) > 1 else None
-    content_cps = (len(content) / content_span) if (content_span and len(content)) else None
+    # 本文が一気に届く（バースト）と span が極小になり速度が過大になるので、分割数を要求する
+    content_cps = (len(content) / content_span) if (
+        content_span and content_span > 0.05 and len(content_times) >= 5 and len(content)) else None
     R_out = ((completion - 1) / span) if (span and usage_available and completion > 1) else None
 
     if state == "ok":

@@ -3,6 +3,8 @@
 日本語で記述した固定 workload を OpenAI 互換 API（`/v1/chat/completions`）に投げ、
 **クライアント側で観測できる速度とタスク終結時間**を記録する実験用ハーネス。
 
+実測結果は [`docs/RESULTS.md`](docs/RESULTS.md)（2 SUT: DeepSeek V4.1 Flash 1017 BLACKFOLD EXL3/TP2 と GLM-5.3-Flash-Uncensored TensorFold）。
+
 評価対象はモデル単体ではなく **SUT**（モデル重み・量子化・tokenizer・chat template・推論エンジン・
 GPU・並列化・sampling・ネットワークの全体）。同じモデル名でも構成が違えば別の SUT として扱う。
 
