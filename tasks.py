@@ -1314,6 +1314,74 @@ def grade_prose_longform(text, meta):
     return (not bad), ("ok" if not bad else "; ".join(bad))
 
 
+
+# --- 散文の入力バリアント（同じ採点契約・違う題材） ---
+T_PROSE_EXPLAIN_2 = {
+    "id": "prose_explain_2",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語の説明文を書いてください。
+
+テーマ: 自治体が住民サービスをクラウドへ移行する際の注意点
+
+条件:
+- 400文字以上600文字以内（空白・改行を除いて数える）
+- 3段落に分ける（段落の間は空行を1行入れる）
+- 「クラウド」と「コスト」をそれぞれ1回以上含める
+- 箇条書き・見出し・コードブロックは使わない
+- 前置きや説明は書かず、本文だけを出力する""",
+}
+
+T_PROSE_PROCEDURE_2 = {
+    "id": "prose_procedure_2",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語の手順書を書いてください。
+
+テーマ: 基幹システムで障害が発生した際の一次対応手順
+
+条件:
+- 5つのステップを「1.」から「5.」まで番号付きで、この順に書く
+- 各ステップは40文字以上（空白・改行を除いて数える）
+- 全体で500文字以上
+- 番号以外の箇条書き記号（-、・、*）は使わない
+- 前置きや説明は書かず、手順だけを出力する""",
+}
+
+T_PROSE_EMAIL_2 = {
+    "id": "prose_email_2",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語のビジネスメールを書いてください。
+
+状況: 取引先（山田製作所 佐藤様）に、部品の仕様変更の確認を依頼する
+
+条件:
+- 1行目に「件名: 」で始まる件名を書く
+- 宛名の行に「佐藤様」を含める
+- 全体で300文字以上500文字以内（空白・改行を除いて数える）
+- 「納期」と「確認」をそれぞれ1回以上含める
+- 箇条書きは使わない
+- 前置きや説明は書かず、メール本文だけを出力する""",
+}
+
+T_PROSE_LONGFORM_2 = {
+    "id": "prose_longform_2",
+    "kind": "text",
+    "max_tokens": 8192,
+    "prompt": """次の条件で日本語の文章を書いてください。
+
+テーマ: 物流業界の人手不足への対応策
+
+条件:
+- 1000文字以上1400文字以内（空白・改行を除いて数える）
+- 5段落に分ける（段落の間は空行を1行入れる）
+- 各段落は3文以上（「。」で区切って数える）
+- 「現場」と「データ」をそれぞれ1回以上含める
+- 箇条書き・見出しは使わない
+- 前置きや説明は書かず、本文だけを出力する""",
+}
+
 TASKS = [
     dict(T_CODE_WORDS, grader=grade_code_words),
     dict(T_CODE_YEN, grader=grade_yen),
@@ -1333,6 +1401,10 @@ TASKS = [
     dict(T_PROSE_PROCEDURE, grader=grade_prose_procedure),
     dict(T_PROSE_EMAIL, grader=grade_prose_email),
     dict(T_PROSE_LONGFORM, grader=grade_prose_longform),
+    dict(T_PROSE_EXPLAIN_2, grader=grade_prose_explain),
+    dict(T_PROSE_PROCEDURE_2, grader=grade_prose_procedure),
+    dict(T_PROSE_EMAIL_2, grader=grade_prose_email),
+    dict(T_PROSE_LONGFORM_2, grader=grade_prose_longform),
 ]
 
 TASK_BY_ID = {t["id"]: t for t in TASKS}

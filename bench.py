@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import random
 import queue
 import threading
 import json
@@ -346,56 +347,90 @@ def wait_ready(base, model, temperature=0.0, max_wait=1800):
     raise RuntimeError(f"{model}: モデルが {max_wait}s 以内に準備完了しなかった")
 
 
-def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
-    """TTFT_any = a + b * prompt_tokens を**全有効対**で最小二乗し、1/b を実効入力傾きの逆数とする。
+def _bootstrap_slope_ci(blocks, n_boot=2000, seed=1234):
+    """ブロック単位のクラスタ・ブートストラップで傾きの95%CI（tok/s に逆変換）を出す。"""
+    rng = random.Random(seed)
+    slopes = []
+    for _ in range(n_boot):
+        pick = [blocks[rng.randrange(len(blocks))] for _ in blocks]
+        pairs = [p for b in pick for p in b]
+        xs = [x for x, _ in pairs]
+        ys = [y for _, y in pairs]
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        sxx = sum((x - mx) ** 2 for x in xs)
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        if sxx > 0 and sxy > 0:
+            slopes.append(sxy / sxx)
+    if not slopes:
+        return None
+    slopes.sort()
+    lo = slopes[int(0.025 * len(slopes))]
+    hi = slopes[min(len(slopes) - 1, int(0.975 * len(slopes)))]
+    return [round(1 / hi, 1), round(1 / lo, 1)]
 
-    - 採用する変数は `TTFT_any`（最初の非空 delta。reasoning でもよい）。仕様の TTFT_answer は
-      `ttft_answer_valid` として別に数える（8 token の probe は本文を出さないことが多い）
-    - 遅い試行を捨てない（`ttft < 30` の選別なし）
-    - x と y は**同じ試行の対**を使う（長さごとの中央値と最後の試行の token 数を混ぜない）
-    - 全滅した長さは `failed_lengths` に残し、例外で測定全体を落とさない
+
+def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0, blocks=3):
+    """TTFT_any = a + b * prompt_tokens を全有効対で最小二乗し、1/b とブロックCIを返す。
+
+    - 変数は `TTFT_any`（最初の非空 delta）。`TTFT_answer` は `ttft_answer_valid` として別記録
+    - ブロック内で長さ順をランダム化（時間ドリフトと長さ効果を分離する）
+    - 遅い試行を捨てない。全滅した長さは `failed_lengths` に残す
+    - 傾きの 95%CI は**ブロック単位のクラスタ・ブートストラップ**
     """
     chat_stream(base, model, build_prompt(min(lengths)), max_tokens=8,
                 temperature=temperature, timeout=900)
     time.sleep(0.5)
-    samples, pairs, failed_lengths = [], [], []
+    pairs, block_pairs, attempts_all = [], [], []
+    per_len = {c: {"ttft": [], "tok": []} for c in lengths}
     answer_valid = 0
-    for chars in lengths:
-        attempts = []
-        for k in range(reps):
-            prompt = build_prompt(chars)  # 反復ごとに salt を作り直す
-            r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
-            valid = (r["ttft_any"] is not None and r["prompt_tokens"]
-                     and r["state"] in ("ok", "empty", "truncated"))
-            attempts.append({"ttft_any": r["ttft_any"], "ttft_answer": r["ttft_answer"],
-                             "prompt_tokens": r["prompt_tokens"], "state": r["state"],
-                             "finish_reason": r["finish_reason"], "valid": bool(valid)})
-            if valid:
-                pairs.append((r["prompt_tokens"], r["ttft_any"]))
-                if r["ttft_answer"] is not None:
-                    answer_valid += 1
-            if k < reps - 1:
-                time.sleep(gap)
-        ok = [a for a in attempts if a["valid"]]
-        if not ok:
-            failed_lengths.append(chars)
-        samples.append({
-            "chars": chars,
-            "prompt_tokens_median": round(statistics.median([a["prompt_tokens"] for a in ok]), 1) if ok else None,
-            "ttft_median": round(statistics.median([a["ttft_any"] for a in ok]), 4) if ok else None,
-            "ttft_all": [round(a["ttft_any"], 4) for a in ok],
-            "requested": reps, "valid": len(ok), "failed": reps - len(ok),
-            "attempts": attempts,
-            "tokens_per_char": round(statistics.median([a["prompt_tokens"] for a in ok]) / chars, 3) if ok else None,
-        })
-        time.sleep(0.3)
+    order_rng = random.Random(4242)
+    for b in range(blocks):
+        order = list(lengths)
+        order_rng.shuffle(order)
+        this_block = []
+        for chars in order:
+            for k in range(reps):
+                prompt = build_prompt(chars)  # 反復ごとに salt を作り直す
+                r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
+                valid = (r["ttft_any"] is not None and r["prompt_tokens"]
+                         and r["state"] in ("ok", "empty", "truncated"))
+                attempts_all.append({"block": b, "chars": chars, "rep": k,
+                                     "ttft_any": r["ttft_any"], "ttft_answer": r["ttft_answer"],
+                                     "prompt_tokens": r["prompt_tokens"], "state": r["state"],
+                                     "finish_reason": r["finish_reason"], "valid": bool(valid)})
+                if valid:
+                    pairs.append((r["prompt_tokens"], r["ttft_any"]))
+                    this_block.append((r["prompt_tokens"], r["ttft_any"]))
+                    per_len[chars]["ttft"].append(r["ttft_any"])
+                    per_len[chars]["tok"].append(r["prompt_tokens"])
+                    if r["ttft_answer"] is not None:
+                        answer_valid += 1
+                if k < reps - 1:
+                    time.sleep(gap)
+            time.sleep(0.2)
+        if this_block:
+            block_pairs.append(this_block)
 
+    failed_lengths = [c for c in lengths if not per_len[c]["ttft"]]
+    samples = []
+    for c in lengths:
+        tt = per_len[c]["ttft"]
+        tk = per_len[c]["tok"]
+        samples.append({
+            "chars": c,
+            "n": len(tt),
+            "ttft_median": round(statistics.median(tt), 4) if tt else None,
+            "prompt_tokens_median": round(statistics.median(tk), 1) if tk else None,
+            "tokens_per_char": round(statistics.median(tk) / c, 3) if tk else None,
+        })
+
+    total_req = blocks * reps * len(lengths)
     if len(pairs) < 2:
-        return {"prefill_tps": None, "intercept_s": None, "r2": None, "samples": samples,
-                "mean_tokens_per_char": None, "requested": reps * len(lengths),
-                "valid": len(pairs), "failed": reps * len(lengths) - len(pairs),
-                "probe_reps": reps, "failed_lengths": failed_lengths,
-                "ttft_answer_valid": answer_valid,
+        return {"prefill_tps": None, "prefill_ci95": None, "intercept_s": None, "r2": None,
+                "samples": samples, "mean_tokens_per_char": None,
+                "requested": total_req, "valid": len(pairs), "failed": total_req - len(pairs),
+                "probe_reps": reps, "blocks": blocks, "failed_lengths": failed_lengths,
+                "ttft_answer_valid": answer_valid, "pairs": [],
                 "note": "有効対が2未満のため傾きを推定できない"}
 
     xs = [x for x, _ in pairs]
@@ -404,10 +439,7 @@ def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
     mx, my = sum(xs) / n, sum(ys) / n
     sxx = sum((x - mx) ** 2 for x in xs)
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    if sxx == 0:
-        b = None
-    else:
-        b = sxy / sxx
+    b = sxy / sxx if sxx else None
     a = (my - b * mx) if b is not None else None
     ss_tot = sum((y - my) ** 2 for y in ys)
     ss_res = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) if b is not None else None
@@ -415,19 +447,21 @@ def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
     tpc = [s["tokens_per_char"] for s in samples if s["tokens_per_char"]]
     return {
         "prefill_tps": (1 / b) if (b and b > 0) else None,
+        "prefill_ci95": _bootstrap_slope_ci(block_pairs) if len(block_pairs) >= 2 else None,
         "intercept_s": a,
         "r2": r2,
         "samples": samples,
         "mean_tokens_per_char": round(statistics.mean(tpc), 3) if tpc else None,
-        "requested": reps * len(lengths),
+        "requested": total_req,
         "valid": len(pairs),
-        "failed": reps * len(lengths) - len(pairs),
+        "failed": total_req - len(pairs),
+        "probe_reps": reps,
+        "blocks": blocks,
         "failed_lengths": failed_lengths,
         "ttft_answer_valid": answer_valid,
-        "probe_reps": reps,
         "pairs": [[x, round(y, 4)] for x, y in pairs],
-        "note": ("TTFT_any の全有効対による傾き。切片はネットワーク+キュー待ち+固定費の合計で、"
-                 "内訳を分離した値ではない。3点では折れ曲がりを診断できない"),
+        "note": ("TTFT_any の全有効対による傾き。3ブロック×ランダム順。CI はブロック・ブートストラップ "
+                 "(n=2000)。切片はネットワーク+キュー待ち+固定費の合計で内訳ではない"),
     }
 
 
@@ -661,7 +695,9 @@ def markdown(results):
         sm = res["summary"]
         lines += [f"## {res['model']}", "",
                   "| 指標 | 値 |", "|---|---|",
-                  f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s (傾き法, R²={fmt(s.get('r2'), 3)}, n={s.get('probe_reps', '-')}中央値) |",
+                  f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s"
+                  + (f"（95%CI {fmt(s['prefill_ci95'][0], 0)}–{fmt(s['prefill_ci95'][1], 0)}）" if s.get("prefill_ci95") else "")
+                  + f" (TTFT_any 全対回帰, R²={fmt(s.get('r2'), 3)}, {s.get('prefill_blocks', '-')}ブロック×{s.get('probe_reps', '-')}回) |",
                   f"| 日本語トークン効率 | {fmt(s.get('tokens_per_char'), 3)} tok/文字（入力。1文字1トークン超は日本語の割高） |",
                   f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s"
                   + (f" / 実効 {fmt(s.get('decode_chars_per_s'), 1)} 文字/s・本文のみ "
@@ -814,6 +850,8 @@ def main():
     ap.add_argument("--scenario", default="S1", choices=["S1", "S2", "S3"])
     ap.add_argument("--probe-reps", type=int, default=3,
                     help="prefill/decode probe の反復回数（中央値を採用）")
+    ap.add_argument("--prefill-blocks", type=int, default=3,
+                    help="prefill probe のブロック数（ブロック内で長さ順をランダム化）")
     ap.add_argument("--probe-gap", type=float, default=2.0,
                     help="probe 反復間の idle 秒")
     ap.add_argument("--decode-style", default="prose", choices=["prose", "numbers"],
@@ -853,7 +891,7 @@ def main():
             lengths = [int(x) for x in args.prefill_lengths.split(",")]
             print(f"  prefill probe (chars={lengths})...", flush=True)
             pre = measure_prefill(args.base_url, model, lengths, args.temperature,
-                                   args.probe_reps, args.probe_gap)
+                                   args.probe_reps, args.probe_gap, blocks=args.prefill_blocks)
             print(f"    prefill: {fmt(pre['prefill_tps'], 0)} tok/s (R2={fmt(pre['r2'], 3)})", flush=True)
             print("  decode probe...", flush=True)
             dec = measure_decode(args.base_url, model, args.temperature,
@@ -863,6 +901,8 @@ def main():
                   f"{fmt(dec['tokens_per_chunk'], 2)} tok/chunk)", flush=True)
             speed = {"prefill": pre, "decode": dec,
                      "prefill_tps": pre["prefill_tps"],
+                     "prefill_ci95": pre.get("prefill_ci95"),
+                     "prefill_blocks": pre.get("blocks"),
                      "intercept_s": pre["intercept_s"],
                      "r2": pre["r2"],
                      "prefill_samples": pre["samples"],

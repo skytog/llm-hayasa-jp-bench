@@ -219,6 +219,11 @@ BAD["prose_procedure"] = "\n".join(f"{i}. 短い。" for i in range(1, 6))      
 BAD["prose_email"] = _pad(_S1, 180) + "\n" + _pad(_S2, 180) + "\n納期と確認。"  # 件名・宛名なし
 BAD["prose_longform"] = "\n\n".join([_pad(_S1, 200)] * 4)                      # 4段落
 
+# 入力バリアントは採点契約が同じなので、同じ GOOD/BAD を使う
+for _v in ("prose_explain_2", "prose_procedure_2", "prose_email_2", "prose_longform_2"):
+    GOOD[_v] = GOOD[_v[:-2]]
+    BAD[_v] = BAD[_v[:-2]]
+
 ok = True
 for tid, task in TASK_BY_ID.items():
     p, d = task["grader"](GOOD[tid], {})
