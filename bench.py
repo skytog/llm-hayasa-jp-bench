@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import queue
+import threading
 import json
 import os
 import re
@@ -38,16 +40,31 @@ _API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY")
 # ------------------------------------------------------------------ HTTP
 
 
-def _sse_events(resp):
-    """SSE のイベント境界（空行）で区切って返す。CRLF も扱う。"""
+def _sse_events(resp, deadline=None, max_event_bytes=1_000_000, max_total_bytes=64_000_000):
+    """SSE のイベント境界（空行）で区切って返す。CRLF も扱う。
+
+    受信バイト単位で絶対期限・イベントサイズ・総受信量を制限する
+    （区切りのない長いイベントが buf を無限に伸ばすのを防ぐ）。
+    """
     buf = b""
-    for chunk in resp.iter_content(chunk_size=8192):
+    total = 0
+    # iter_content(chunk_size=N) は N バイト貯まるまで返さないことがあり、TTFT を過大にする。
+    # read1 は「今ある分」を返すので、最初の delta の到着時刻を素直に観測できる。
+    chunks = iter(lambda: resp.raw.read1(65536, decode_content=True), b"")
+    for chunk in chunks:
         if not chunk:
             continue
+        total += len(chunk)
+        if total > max_total_bytes:
+            raise RuntimeError(f"response too large: {total} bytes")
+        if deadline is not None and time.perf_counter() > deadline:
+            raise TimeoutError("absolute deadline exceeded (while receiving bytes)")
         buf += chunk
         buf = buf.replace(b"\r\n", b"\n")
         while b"\n\n" in buf:
             event, buf = buf.split(b"\n\n", 1)
+            if len(event) > max_event_bytes:
+                raise RuntimeError(f"SSE event too large: {len(event)} bytes")
             yield event.decode("utf-8", "replace")
     if buf.strip():
         yield buf.decode("utf-8", "replace")
@@ -142,18 +159,55 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     for attempt in range(retry + 1):
         try:
             headers = {"Authorization": f"Bearer {_API_KEY}"} if _API_KEY else {}
-            with requests.post(url, json=body, headers=headers, stream=True,
-                               timeout=(10, min(30.0, max(1.0, timeout)))) as r:
+            r = requests.post(url, json=body, headers=headers, stream=True,
+                              timeout=(10, min(30.0, max(1.0, timeout))))
+            try:
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-                for event in _sse_events(r):
+                # 読み取りは別スレッドに任せる。終端後や deadline 後は消費をやめるだけでよく、
+                # 接続が閉じないサーバーでも Task Time に待ち時間が混ざらない
+                q = queue.Queue()
+
+                def _reader(resp):
+                    try:
+                        for ev in _sse_events(resp, deadline=deadline):
+                            q.put(("event", ev))
+                    except Exception as e:  # noqa: BLE001
+                        q.put(("error", f"{type(e).__name__}: {e}"))
+                    finally:
+                        q.put(("end", None))
+                        try:
+                            resp.close()  # ソケット解放（drain はこのスレッド内で行う）
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                threading.Thread(target=_reader, args=(r,), daemon=True).start()
+                while True:
+                    try:
+                        kind, payload = q.get(timeout=1.0)
+                    except queue.Empty:
+                        if time.perf_counter() > deadline:
+                            state = "timeout"
+                            last_err = f"absolute deadline {timeout}s exceeded"
+                            break
+                        continue
+                    if kind == "end":
+                        break
+                    if kind == "error":
+                        if "deadline" in payload.lower():
+                            state = "timeout"
+                        else:
+                            state = "error"
+                        last_err = payload
+                        break
+                    event = payload
                     if time.perf_counter() > deadline:
                         state = "timeout"
                         last_err = f"absolute deadline {timeout}s exceeded"
                         break
                     if _is_done(event):
                         done_seen = True
-                        continue
+                        break
                     obj = _parse_event(event)
                     if obj is None:
                         parse_errors += 1
@@ -182,6 +236,9 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
                                 reasoning_parts.append(think)
                 if state == "timeout":
                     break
+            finally:
+                # close は drain して接続を再利用しようとするので呼ばない（daemon スレッドが保持）
+                pass
             break
         except requests.exceptions.Timeout as e:  # noqa: BLE001
             last_err = e
@@ -211,6 +268,8 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
     if state == "ok":
         if require_done and not done_seen:
             state = "truncated"
+        elif finish_reason is None:
+            state = "truncated"  # 仕様: finish_reason が無い正常終了は truncated
         elif not content.strip():
             state = "empty"
 
@@ -222,6 +281,8 @@ def chat_stream(base, model, prompt, max_tokens, temperature=0.0, timeout=600, r
         "ttft_any": ttft_any,
         "ttft_answer": ttft_answer,
         "l": chunk_times[-1] if chunk_times else None,
+        "chunk_count": len(chunk_times),
+        "content_chunk_count": len(content_times),
         "content_span": content_span,
         "content_chars_per_s": round(content_cps, 2) if content_cps else None,
         "total": total,
@@ -286,63 +347,87 @@ def wait_ready(base, model, temperature=0.0, max_wait=1800):
 
 
 def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0):
-    """TTFT = a + b * prompt_tokens を最小二乗で当てはめ、1/b を prefill tok/s とする。"""
-    # 最初の1本は捨てる（キャッシュ初期化などを避ける）
+    """TTFT_any = a + b * prompt_tokens を**全有効対**で最小二乗し、1/b を実効入力傾きの逆数とする。
+
+    - 採用する変数は `TTFT_any`（最初の非空 delta。reasoning でもよい）。仕様の TTFT_answer は
+      `ttft_answer_valid` として別に数える（8 token の probe は本文を出さないことが多い）
+    - 遅い試行を捨てない（`ttft < 30` の選別なし）
+    - x と y は**同じ試行の対**を使う（長さごとの中央値と最後の試行の token 数を混ぜない）
+    - 全滅した長さは `failed_lengths` に残し、例外で測定全体を落とさない
+    """
     chat_stream(base, model, build_prompt(min(lengths)), max_tokens=8,
                 temperature=temperature, timeout=900)
     time.sleep(0.5)
-    samples = []
+    samples, pairs, failed_lengths = [], [], []
+    answer_valid = 0
     for chars in lengths:
-        ts, tokens, attempts = [], None, []
+        attempts = []
         for k in range(reps):
-            # 反復ごとに salt を作り直す（同じプロンプトだと 2 回目以降が prefix cache に当たる）
-            prompt = build_prompt(chars)
+            prompt = build_prompt(chars)  # 反復ごとに salt を作り直す
             r = chat_stream(base, model, prompt, max_tokens=8, temperature=temperature, timeout=600)
-            valid = (r["ttft"] is not None and r["prompt_tokens"]
-                     and r["state"] in ("ok", "empty", "truncated") and r["ttft"] < 30)
-            attempts.append({"ttft": r["ttft"], "prompt_tokens": r["prompt_tokens"],
-                             "state": r["state"], "valid": bool(valid)})
+            valid = (r["ttft_any"] is not None and r["prompt_tokens"]
+                     and r["state"] in ("ok", "empty", "truncated"))
+            attempts.append({"ttft_any": r["ttft_any"], "ttft_answer": r["ttft_answer"],
+                             "prompt_tokens": r["prompt_tokens"], "state": r["state"],
+                             "finish_reason": r["finish_reason"], "valid": bool(valid)})
             if valid:
-                ts.append(r["ttft"])
-                tokens = r["prompt_tokens"]
+                pairs.append((r["prompt_tokens"], r["ttft_any"]))
+                if r["ttft_answer"] is not None:
+                    answer_valid += 1
             if k < reps - 1:
                 time.sleep(gap)
-        if not ts:
-            raise RuntimeError(f"prefill probe failed ({chars} chars): 有効な試行なし "
-                               f"(states={[a['state'] for a in attempts]})")
-        samples.append({"chars": chars, "prompt_tokens": tokens,
-                        "ttft": round(statistics.median(ts), 4),
-                        "ttft_all": [round(t, 4) for t in ts],
-                        "requested": reps, "valid": len(ts), "failed": reps - len(ts),
-                        "attempts": attempts,
-                        "tokens_per_char": round(tokens / chars, 3)})
+        ok = [a for a in attempts if a["valid"]]
+        if not ok:
+            failed_lengths.append(chars)
+        samples.append({
+            "chars": chars,
+            "prompt_tokens_median": round(statistics.median([a["prompt_tokens"] for a in ok]), 1) if ok else None,
+            "ttft_median": round(statistics.median([a["ttft_any"] for a in ok]), 4) if ok else None,
+            "ttft_all": [round(a["ttft_any"], 4) for a in ok],
+            "requested": reps, "valid": len(ok), "failed": reps - len(ok),
+            "attempts": attempts,
+            "tokens_per_char": round(statistics.median([a["prompt_tokens"] for a in ok]) / chars, 3) if ok else None,
+        })
         time.sleep(0.3)
 
-    xs = [s["prompt_tokens"] for s in samples]
-    ys = [s["ttft"] for s in samples]
+    if len(pairs) < 2:
+        return {"prefill_tps": None, "intercept_s": None, "r2": None, "samples": samples,
+                "mean_tokens_per_char": None, "requested": reps * len(lengths),
+                "valid": len(pairs), "failed": reps * len(lengths) - len(pairs),
+                "probe_reps": reps, "failed_lengths": failed_lengths,
+                "ttft_answer_valid": answer_valid,
+                "note": "有効対が2未満のため傾きを推定できない"}
+
+    xs = [x for x, _ in pairs]
+    ys = [y for _, y in pairs]
     n = len(xs)
     mx, my = sum(xs) / n, sum(ys) / n
     sxx = sum((x - mx) ** 2 for x in xs)
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     if sxx == 0:
-        raise RuntimeError("prefill probe: prompt lengths identical")
-    b = sxy / sxx
-    a = my - b * mx
+        b = None
+    else:
+        b = sxy / sxx
+    a = (my - b * mx) if b is not None else None
     ss_tot = sum((y - my) ** 2 for y in ys)
-    ss_res = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    ss_res = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) if b is not None else None
+    r2 = (1 - ss_res / ss_tot) if (b is not None and ss_tot > 0) else None
+    tpc = [s["tokens_per_char"] for s in samples if s["tokens_per_char"]]
     return {
-        "prefill_tps": (1 / b) if b > 0 else None,
+        "prefill_tps": (1 / b) if (b and b > 0) else None,
         "intercept_s": a,
         "r2": r2,
         "samples": samples,
-        "mean_tokens_per_char": round(
-            sum(s["tokens_per_char"] for s in samples) / len(samples), 3),
-        "requested": reps * len(samples),
-        "valid": sum(s["valid"] for s in samples),
-        "failed": sum(s["failed"] for s in samples),
+        "mean_tokens_per_char": round(statistics.mean(tpc), 3) if tpc else None,
+        "requested": reps * len(lengths),
+        "valid": len(pairs),
+        "failed": reps * len(lengths) - len(pairs),
+        "failed_lengths": failed_lengths,
+        "ttft_answer_valid": answer_valid,
         "probe_reps": reps,
-        "note": "TTFTの傾き法（反復ごとに salt を変え prefix cache を外す）。切片=ネットワーク+キュー待ち+固定オーバーヘッド",
+        "pairs": [[x, round(y, 4)] for x, y in pairs],
+        "note": ("TTFT_any の全有効対による傾き。切片はネットワーク+キュー待ち+固定費の合計で、"
+                 "内訳を分離した値ではない。3点では折れ曲がりを診断できない"),
     }
 
 
@@ -379,7 +464,7 @@ def measure_decode(base, model, temperature=0.0, reps=3, gap=2.0, style="prose")
             "gap_p50_ms": (statistics.median(itls) * 1000) if itls else None,
             "gap_p90_ms": ((sorted(itls)[int(len(itls) * 0.9) - 1] * 1000)
                             if len(itls) > 1 else ((itls[0] * 1000) if itls else None)),
-            "tokens_per_chunk": round(r["completion_tokens"] / len(itls), 2)
+            "tokens_per_chunk": round(r["completion_tokens"] / r["chunk_count"], 2)
             if (r["completion_tokens"] and itls) else None,
             "ttft_any": r["ttft_any"],
             "ttft_answer": r["ttft_answer"],

@@ -36,6 +36,20 @@ def _extract_python(text: str) -> str:
     return textwrap.dedent(code).strip("\n")
 
 
+def _reject_const(x):
+    raise ValueError(f"non-finite constant: {x}")
+
+
+def _no_dup_pairs(pairs):
+    seen, out = set(), {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(f"duplicate key: {k}")
+        seen.add(k)
+        out[k] = v
+    return out
+
+
 def _extract_json(text: str) -> dict | None:
     body = _strip_fences(text).strip()
     # 最初の { から最後の } まで
@@ -174,6 +188,37 @@ class GraderUnavailable(RuntimeError):
 ALLOW_NO_SANDBOX = os.environ.get("LLM_BENCH_ALLOW_NO_SANDBOX") == "1"
 
 
+def _run_bounded(cmd, timeout=120, limit=2_000_000):
+    """子プロセスの出力をバイト上限つきで読む（親のメモリを守る）。"""
+    import threading
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = bytearray(), bytearray()
+
+    def reader(stream, buf):
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            room = limit - len(buf)
+            if room > 0:
+                buf.extend(chunk[:room])
+
+    t1 = threading.Thread(target=reader, args=(p.stdout, out), daemon=True)
+    t2 = threading.Thread(target=reader, args=(p.stderr, err), daemon=True)
+    t1.start(); t2.start()
+    status = "ok"
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        status = "timeout"
+    t1.join(3); t2.join(3)
+    if len(out) >= limit or len(err) >= limit:
+        status = "truncated" if status == "ok" else status
+    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), status
+
+
 def _run_cases(code: str, cases: list[dict], timeout: int = 120) -> list[dict]:
     """候補コードを隔離環境で実行し、各ケースの戻り値だけを返す。
 
@@ -230,23 +275,29 @@ def _run_cases(code: str, cases: list[dict], timeout: int = 120) -> list[dict]:
                 "--memory", "512m", "--memory-swap", "512m",
                 "--pids-limit", "128", "--cpus", "1",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--user", "65534:65534",
                 "-w", "/work",
                 "python:3.12-slim", "python", "-I", "-B", "/work/runner.py",
             ]
-            try:
-                r = subprocess.run(["sg", "docker", "-c", shlex.join(cmd)],
-                                   capture_output=True, text=True, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                subprocess.run(["sg", "docker", "-c", f"docker rm -f {name}"],
-                               capture_output=True, timeout=20)
+            stdout, stderr, status = _run_bounded(["sg", "docker", "-c", shlex.join(cmd)],
+                                                  timeout=timeout)
+            subprocess.run(["sg", "docker", "-c", f"docker rm -f {name}"],
+                           capture_output=True, timeout=20)
+            if status == "timeout":
                 return [{"ok": False, "error": "timeout"} for _ in cases]
+            class _R:
+                pass
+            r = _R()
+            r.stdout, r.stderr = stdout, stderr
         else:
-            env = {"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"}
-            try:
-                r = subprocess.run([sys.executable, "-I", "-B", os.path.join(d, "runner.py")],
-                                   capture_output=True, text=True, timeout=timeout, cwd=d, env=env)
-            except subprocess.TimeoutExpired:
+            stdout, stderr, status = _run_bounded(
+                [sys.executable, "-I", "-B", os.path.join(d, "runner.py")], timeout=timeout)
+            if status == "timeout":
                 return [{"ok": False, "error": "timeout"} for _ in cases]
+            class _R:
+                pass
+            r = _R()
+            r.stdout, r.stderr = stdout, stderr
 
         line = None
         for ln in reversed(r.stdout.splitlines()):
@@ -280,8 +331,12 @@ def _check_cases(code: str, cases: list[dict], expected: list[dict]) -> tuple[bo
             continue
         if not res.get("ok"):
             return False, f"case={c}: raised {res.get('error')}"
-        if res.get("result") != exp["value"]:
-            return False, f"case={c}: got {res.get('result')!r}, expected {exp['value']!r}"
+        got = res.get("result")
+        want = exp["value"]
+        if isinstance(want, bool) != isinstance(got, bool) or got != want:
+            return False, f"case={c}: got {got!r}, expected {want!r}"
+        if isinstance(want, (int, float)) and type(got) is not type(want) and not isinstance(want, bool):
+            return False, f"case={c}: 型が違う {type(got).__name__} != {type(want).__name__}"
         if "args_after" in exp and res.get("args_after") != exp["args_after"]:
             return False, f"case={c}: 入力が変更された {res.get('args_after')!r}"
     return True, f"ok ({len(cases)} cases)"
@@ -755,6 +810,8 @@ def grade_sentiment(text, meta):
     d = _extract_json(text)
     if d is None:
         return False, "invalid json"
+    if set(d.keys()) != {"sentiment", "score"}:
+        return False, f"キー集合={sorted(d.keys())}"
     s = str(d.get("sentiment", "")).strip().lower()
     score = d.get("score")
     if s != "positive":
@@ -807,6 +864,8 @@ def grade_longctx(text, meta):
     d = _extract_json(text)
     if d is None:
         return False, "invalid json"
+    if set(d.keys()) != set(T_LONGCTX["expected"].keys()):
+        return False, f"キー集合={sorted(d.keys())}"
     exp = T_LONGCTX["expected"]
     bad = []
     for k, v in exp.items():
@@ -968,6 +1027,8 @@ def grade_reconcile(text, meta):
     d = _extract_json(text)
     if d is None:
         return False, "invalid json"
+    if set(d.keys()) != set(T_RECONCILE["expected"].keys()):
+        return False, f"キー集合={sorted(d.keys())}"
     exp = T_RECONCILE["expected"]
     bad = []
     for k, v in exp.items():
@@ -1011,7 +1072,8 @@ def grade_table(text, meta):
     if i < 0 or j <= i:
         return False, "invalid json array"
     try:
-        got = json.loads(body[i:j + 1])
+        got = json.loads(body[i:j + 1], parse_constant=_reject_const,
+                          object_pairs_hook=_no_dup_pairs)
     except Exception as e:  # noqa: BLE001
         return False, f"json error: {e}"
     if not isinstance(got, list):
@@ -1022,6 +1084,8 @@ def grade_table(text, meta):
     for g, e in zip(got, exp):
         if not isinstance(g, dict):
             return False, f"要素がobjectでない: {g!r}"
+        if set(g.keys()) != {"部署", "売上", "前年比"}:
+            return False, f"要素のキー集合={sorted(g.keys())}"
         if _norm(g.get("部署", "")) != e["部署"]:
             return False, f"部署 {g.get('部署')!r} (expected {e['部署']})"
         sv, pv = g.get("売上"), g.get("前年比")
@@ -1074,8 +1138,14 @@ def _prose_paras(body: str) -> list:
 
 
 def _prose_bullets(body: str) -> list:
+    # 日本語の箇条書きは記号の直後に空白を置かないことが多い（「・項目」）
     return [ln for ln in body.splitlines()
-            if re.match(r"^\s*([-*・●○◆]|\d+[.)．、])\s+", ln)]
+            if re.match(r"^\s*([-*・●○◆]|\d+[.)．、])\s*\S", ln)]
+
+
+def _prose_sentences(p: str) -> list:
+    parts = [x.strip() for x in re.split(r"[。！？]", p)]
+    return [x for x in parts if _prose_chars(x) >= 2]
 
 
 def _prose_headings(body: str) -> list:
@@ -1140,22 +1210,29 @@ T_PROSE_PROCEDURE = {
 
 
 def grade_prose_procedure(text, meta):
+    """ステップは複数行に折り返してよい。番号行から次の番号行までを1ステップとして数える。"""
     body = _prose_body(text)
-    steps = []
+    steps, cur = [], None
     for ln in body.splitlines():
-        m = re.match(r"^\s*(\d+)[.)．、]\s*(.+)$", ln)
+        m = re.match(r"^\s*(\d+)[.)．、]\s*(.*)$", ln)
         if m:
-            steps.append((int(m.group(1)), m.group(2).strip()))
+            cur = {"n": int(m.group(1)), "text": m.group(2)}
+            steps.append(cur)
+        elif cur is not None and ln.strip():
+            cur["text"] += ln.strip()
     bad = []
-    if [n for n, _ in steps] != [1, 2, 3, 4, 5]:
-        bad.append(f"番号列={[n for n, _ in steps]}（1..5が必要）")
-    short = [n for n, t in steps if _prose_chars(t) < 40]
+    if [x["n"] for x in steps] != [1, 2, 3, 4, 5]:
+        bad.append(f"番号列={[x['n'] for x in steps]}（1..5が必要）")
+    short = [x["n"] for x in steps if _prose_chars(x["text"]) < 40]
     if short:
         bad.append(f"40文字未満のステップ={short}")
+    step_chars = sum(_prose_chars(x["text"]) for x in steps)
     total = _prose_chars(body)
     if total < 500:
         bad.append(f"{total}文字（500以上が必要）")
-    if [ln for ln in body.splitlines() if re.match(r"^\s*[-*・●○◆]\s+", ln)]:
+    if step_chars < 400:
+        bad.append(f"ステップ本文の合計{step_chars}文字（400以上が必要。前置きで稼げない）")
+    if [ln for ln in body.splitlines() if re.match(r"^\s*[-*・●○◆]\s*\S", ln)]:
         bad.append("番号以外の箇条書き記号あり")
     return (not bad), ("ok" if not bad else "; ".join(bad))
 
@@ -1183,10 +1260,10 @@ def grade_prose_email(text, meta):
     body = _prose_body(text)
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
     bad = []
-    if not lines or not lines[0].startswith("件名"):
-        bad.append("1行目が件名でない")
-    if "佐藤様" not in body:
-        bad.append("宛名（佐藤様）無し")
+    if not lines or not re.match(r"^件名[:：]\s*\S", lines[0]):
+        bad.append("1行目が「件名: <件名>」でない")
+    if not any("佐藤様" in ln for ln in lines[:5]):
+        bad.append("宛名（佐藤様）が冒頭5行に無い")
     n = _prose_chars(body)
     if not (300 <= n <= 500):
         bad.append(f"{n}文字（300-500が必要）")
@@ -1226,7 +1303,7 @@ def grade_prose_longform(text, meta):
         bad.append(f"{n}文字（1000-1400が必要）")
     if len(paras) != 5:
         bad.append(f"段落{len(paras)}（5が必要）")
-    short = [i + 1 for i, p in enumerate(paras) if p.count("。") < 3]
+    short = [i + 1 for i, p in enumerate(paras) if len(_prose_sentences(p)) < 3]
     if short:
         bad.append(f"3文未満の段落={short}")
     for w in ("現場", "データ"):

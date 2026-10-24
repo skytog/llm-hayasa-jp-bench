@@ -184,6 +184,41 @@ def kanji_to_int(s):
     "business_days": "答え: 22",
 }
 
+# --- 散文4問（文字数を満たす本文を機械的に組み立てる） ---
+import re as _re
+
+_S1 = ("地方の中小企業が基幹業務をクラウドへ移行する場合、事前に業務プロセスの棚卸しを行い、"
+       "月次の運用コストと障害対応の負荷を定量的に比較しておくことが欠かせない。")
+_S2 = ("さらに、現場の担当者が新しい画面に慣れるまでの教育コストを見積もり、"
+       "移行後の問い合わせ窓口を一本化しておくと混乱を避けられる。")
+_S3 = ("加えて、データの保管場所とバックアップ体制を契約書で明確にし、"
+       "数年後の更改時にロックインされない条件を確認しておくべきである。")
+
+
+def _pad(sent, n):
+    out = ""
+    while len(_re.sub(r"\s", "", out)) < n:
+        out += sent
+    return out
+
+
+GOOD["prose_explain"] = "\n\n".join([_pad(_S1, 140), _pad(_S2, 140), _pad(_S3, 140)])
+GOOD["prose_procedure"] = "\n".join(
+    f"{i}. " + _pad("問い合わせを受けたら、まず内容を要約して担当部署を特定し、"
+                    "一次回答に必要な情報を整理してチケットに記録する。", 110)
+    for i in range(1, 6))
+GOOD["prose_email"] = ("件名: 部品納期延期のお願い\n\n山田製作所 佐藤様\n\n"
+                       + _pad(_S1, 180) + "\n" + _pad(_S2, 180)
+                       + "\n納期についてご確認をお願いいたします。")
+GOOD["prose_longform"] = "\n\n".join([_pad(_S1, 200), _pad(_S2, 200), _pad(_S3, 200),
+                                       _pad(_S1.replace("クラウド", "システム"), 200),
+                                       _pad(_S2, 200)])
+
+BAD["prose_explain"] = "\n\n".join([_pad(_S1, 140), _pad(_S2, 140)])          # 2段落・280字
+BAD["prose_procedure"] = "\n".join(f"{i}. 短い。" for i in range(1, 6))          # 40字未満
+BAD["prose_email"] = _pad(_S1, 180) + "\n" + _pad(_S2, 180) + "\n納期と確認。"  # 件名・宛名なし
+BAD["prose_longform"] = "\n\n".join([_pad(_S1, 200)] * 4)                      # 4段落
+
 ok = True
 for tid, task in TASK_BY_ID.items():
     p, d = task["grader"](GOOD[tid], {})
@@ -218,6 +253,18 @@ def merge_intervals(intervals):
     ("business_days", "答え: 21.9", "小数"),
     ("table_extract_filter", "[1,2,3,4]", "要素がobjectでない"),
     ("reconcile_invoices", '{"請求総額":269500,"入金総額":249500,"未入金残高":NaN}', "NaN"),
+    ("long_context_needle", '{"売上高":1248000000,"従業員数":342,"拠点数":17,"余分":1}', "余分キー"),
+    ("classify_sentiment", '{"sentiment":"positive","score":5,"余分":1}', "余分キー"),
+    ("reconcile_invoices", '{"請求総額":269500,"入金総額":249500,"未入金残高":20000,"余分":1}', "余分キー"),
+    ("table_extract_filter",
+     '[{"部署":"営業部","売上":0,"売上":1250,"前年比":8.2},{"部署":"開発部","売上":640,"前年比":15.5},'
+     '{"部署":"営業支援部","売上":320,"前年比":4.4},{"部署":"管理部","売上":210,"前年比":1.0}]', "重複キー"),
+    ("prose_email", "件名ではありません\n" + _pad(_S1, 180) + "本文に佐藤様と納期と確認。" * 3, "件名行が偽"),
+    ("prose_explain", "・" + _pad(_S1, 150) + "\n\n" + _pad(_S2, 150) + "\n\n" + _pad(_S3, 150),
+     "空白なし箇条書き"),
+    ("prose_procedure", _pad("前置きです。", 300) + "\n" + "\n".join(
+        f"{i}、問い合わせ内容を確認し担当部署を特定して一次回答に必要な情報を整理し記録する。"
+        for i in range(1, 6)), "前置きで字数を稼ぐ"),
 ]
 
 # 仕様上の既知の限界（FAIL しないことが正しい）。summary は「制約通過率」であって

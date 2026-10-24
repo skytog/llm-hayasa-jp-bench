@@ -46,20 +46,25 @@ def pct(vals, q):
 
 
 def _request(base, model, timeout, start, deadline, scheduled_s):
-    """1リクエスト。予定到着・実到着・送信後TTFT・到着基準TTFT を記録する。"""
+    """1リクエスト。予定到着・実到着・送信後TTFT・到着基準TTFT を記録する。
+
+    - ttft_arrival = 待ち時間（実到着 − 予定到着）+ 送信後 TTFT。測定開始からの絶対時刻ではない
+    - latency = 予定到着 → 完了（クライアント待ちを含む end-to-end）
+    """
     arrived = time.perf_counter()
+    delay = (arrived - start) - scheduled_s
     try:
         r = chat_stream(base, model, PROMPT, MAX_TOKENS, 0.0, timeout=timeout)
         done = time.perf_counter()
         return {
             "scheduled_s": round(scheduled_s, 4),
             "arrived_s": round(arrived - start, 4),
-            "arrival_delay_s": round(arrived - start - scheduled_s, 4),
+            "arrival_delay_s": round(delay, 4),
             "state": r["state"],
             "finish_reason": r["finish_reason"],
             "ttft_send": r["ttft_any"],
-            "ttft_arrival": ((arrived - start) + r["ttft_any"]) if r["ttft_any"] is not None else None,
-            "latency": round(done - arrived, 4),
+            "ttft_arrival": (delay + r["ttft_any"]) if r["ttft_any"] is not None else None,
+            "latency": round(done - (start + scheduled_s), 4),
             "completed_by_deadline": done <= deadline,
             "completion_tokens": r["completion_tokens"],
             "usage_available": r["usage_available"],
@@ -69,10 +74,10 @@ def _request(base, model, timeout, start, deadline, scheduled_s):
     except Exception as e:  # noqa: BLE001
         done = time.perf_counter()
         return {"scheduled_s": round(scheduled_s, 4), "arrived_s": round(arrived - start, 4),
-                "arrival_delay_s": round(arrived - start - scheduled_s, 4),
+                "arrival_delay_s": round(delay, 4),
                 "state": "error", "error": str(e)[:200], "finish_reason": None,
                 "ttft_send": None, "ttft_arrival": None,
-                "latency": round(done - arrived, 4),
+                "latency": round(done - (start + scheduled_s), 4),
                 "completed_by_deadline": done <= deadline,
                 "completion_tokens": None, "usage_available": False, "R_out": None}
 
@@ -109,28 +114,29 @@ def run_open(base, model, rate, duration, slo_ttft, slo_lat, timeout, max_inflig
     rng = random.Random(12345)
 
     def one(scheduled):
+        sem.acquire()  # 満杯なら待つ。待ちは arrival_delay として記録される
         rec = _request(base, model, timeout, start, deadline, scheduled)
         with lock:
             records.append(rec)
         sem.release()
 
-    while True:
-        now = time.perf_counter()
-        if now >= deadline:
-            break
-        scheduled = now - start
-        sem.acquire()  # 満杯なら待つ（arrival_delay として記録される）
+    # 到着時刻は絶対予定として事前生成する（producer が詰まると rate が崩れるのを防ぐ）
+    arrivals, t_cursor = [], 0.0
+    while t_cursor < duration:
+        arrivals.append(t_cursor)
+        t_cursor += rng.expovariate(rate)
+    for scheduled in arrivals:
+        while time.perf_counter() - start < scheduled:
+            time.sleep(min(0.05, scheduled - (time.perf_counter() - start)))
         t = threading.Thread(target=one, args=(scheduled,), daemon=True)
         t.start()
         threads.append(t)
-        wait = rng.expovariate(rate)
-        if time.perf_counter() + wait > deadline:
-            break
-        time.sleep(wait)
+    offered = len(arrivals)
     for t in threads:
         t.join()
     row = aggregate(records, duration, rate, "open", slo_ttft, slo_lat)
     row["offered_rps"] = rate
+    row["offered_requests"] = offered
     return row
 
 
@@ -175,6 +181,7 @@ def aggregate(records, duration, level, mode, slo_ttft, slo_lat):
         "slo": {"ttft_max_s": slo_ttft, "latency_max_s": slo_lat, "basis": "arrival + end-to-end"},
         "slo_pass": len(slo_ok),
         "slo_denominator": len(stopped),
+        "slo_pass_rate_all_sent": round(len(slo_ok) / len(records), 3) if records else None,
         "slo_pass_rate": round(len(slo_ok) / len(stopped), 3) if stopped else None,
         "goodput_rps": round(len(slo_ok) / duration, 3),
         "records": records,

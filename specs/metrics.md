@@ -41,7 +41,11 @@ reasoning をユーザーに表示しないサービスでは `TTFT_any` だけ�
 
 ブラックボックス API からサーバー側の prefill 区間だけを取り出すことはできない。したがって報告するのは **「実効入力長傾きの逆数」** であり、GPU の純粋な prefill スループットではない。
 
-同一 SUT・無競合・warm・cache 状態を宣言した条件で、複数の入力長 `N` について `TTFT_answer` を測り、
+同一 SUT・無競合・warm・cache 状態を宣言した条件で、複数の入力長 `N` について **`TTFT_any`** を測り、
+`TTFT_any = a + b × prompt_tokens` を**全有効試行の対**（同じ試行の x と y）で最小二乗し、`1/b` を報告する。
+`TTFT_any` を使う理由: probe は短い出力（8 token）で本文を出さないことが多く、`TTFT_answer` は欠測しやすい。
+reasoning モデルでは `TTFT_any` が「最初のトークンが届くまで」を表す。`TTFT_answer` は `ttft_answer_valid`
+として有効数を別記録する（prefill の主変数には使わない）。
 
 ```
 TTFT_ij = alpha + beta * N_ij + u_block(j) + epsilon_ij
@@ -235,9 +239,10 @@ NFC 正規化の有無、改行・空白・数字・記号を数えるかを仕�
 次の2つを分けて記録する。
 
 - **本文区間のみの文字/s** = `content_chars / (最後のcontent delta - 最初のcontent delta)`
-  - reasoning を含めない、純粋な日本語生成の速さ
-- **実効文字/s** = `content_chars / (最後のdelta - 最初のdelta)`
-  - reasoning の時間を含む。ユーザーが本文を受け取るまでの実効速度
+  - reasoning を含まない**本文到着区間のレート**。初回 content chunk の文字数を含むため過大側に出る。
+    `content_span > 0.05s` かつ content chunk が 5 個以上のときだけ値を出す（バースト到着では区間が潰れる）
+- **実効文字/s** = `content_chars / (最後のdeltaの送信からの経過)`
+  - reasoning の時間を含む。ユーザーが本文を受け取るまでの表示効率
 
 両者の比が **reasoning の相対コスト**になる（実測では reasoning が本文の 8〜20 倍の長さになり、
 実効速度が本文区間の 1/8 程度まで落ちる）。`completion_tokens` は reasoning と本文の合計なので、
