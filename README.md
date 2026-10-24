@@ -131,6 +131,17 @@ python3 steady.py --model X --mode open --rate 0.1,0.2,0.3 --duration 60
 - **反復の独立性**: temperature 0 では出力がほぼ決定的（reasoning 文字数まで一致した実測あり）。attempt 単位の Wilson CI は naive iid で、**主表には出さない**（記述値として併記）
 - **S2/S3 は補助**: S2 は finite burst の makespan throughput。S3 は測定窓内の完了だけを数え、SLO は到着基準 TTFT と end-to-end latency で判定し、`finish_reason=stop` のみを goodput に入れる
 
+## 外部 provider（OpenRouter 等）で測るとき
+
+- 認証は `--api-key` か環境変数 `OPENROUTER_API_KEY`
+- **proxy がチャンクをまとめて返す**ことがある（実測: 48.55 tok/chunk、inter-chunk gap p50 242ms）。このとき
+  `R_out` と「本文区間の文字/s」は**配信の粗さに引きずられて過大**になる。比較に使えるのは
+  **リクエスト開始から完了までの実効速度**だけ
+- ネットワークのばらつきで prefill の傾きが定まらないことがある（実測 R²=0.769、傾き不安定 → 算出不能）。
+  ローカル SUT の prefill と並べない
+- temp 0 でも決定論的でない（同じ2問×3回で 2 fail / 1 pass）。ローカル llama-swap は reasoning 文字数まで一致する
+- reasoning のフィールド名が違う（vLLM/DeepSeek 直は `reasoning_content`、OpenRouter は `reasoning`）。実装は両対応
+
 ## 採点ロジックの自己テスト
 
 ```bash
