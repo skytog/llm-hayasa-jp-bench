@@ -369,6 +369,24 @@ def _bootstrap_slope_ci(blocks, n_boot=2000, seed=1234):
     return [round(1 / hi, 1), round(1 / lo, 1)]
 
 
+def _theil_sen(pairs):
+    """全対の傾きの中央値。外れ値に強い（OLS の代替）。"""
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    slopes = []
+    for i in range(len(xs)):
+        for j in range(i + 1, len(xs)):
+            dx = xs[j] - xs[i]
+            if dx:
+                slopes.append((ys[j] - ys[i]) / dx)
+    return statistics.median(slopes) if slopes else None
+
+
+def _pct(vals, q):
+    v = sorted(vals)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+
 def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0, blocks=3):
     """TTFT_any = a + b * prompt_tokens を全有効対で最小二乗し、1/b とブロックCIを返す。
 
@@ -445,8 +463,16 @@ def measure_prefill(base, model, lengths, temperature=0.0, reps=3, gap=2.0, bloc
     ss_res = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) if b is not None else None
     r2 = (1 - ss_res / ss_tot) if (b is not None and ss_tot > 0) else None
     tpc = [s["tokens_per_char"] for s in samples if s["tokens_per_char"]]
+    ts = _theil_sen(pairs)
+    all_ttft = [y for _, y in pairs]
+    ttft_p50 = statistics.median(all_ttft) if all_ttft else None
+    ttft_p95 = _pct(all_ttft, 0.95)
     return {
         "prefill_tps": (1 / b) if (b and b > 0) else None,
+        "prefill_tps_robust": (1 / ts) if (ts and ts > 0) else None,
+        "ttft_p50_s": round(ttft_p50, 4) if ttft_p50 else None,
+        "ttft_p95_s": round(ttft_p95, 4) if ttft_p95 else None,
+        "ttft_jitter_p95_p50": round(ttft_p95 / ttft_p50, 2) if (ttft_p50 and ttft_p95) else None,
         "prefill_ci95": _bootstrap_slope_ci(block_pairs) if len(block_pairs) >= 2 else None,
         "intercept_s": a,
         "r2": r2,
@@ -698,6 +724,8 @@ def markdown(results):
                   f"| Prefill | {fmt(s.get('prefill_tps'), 0)} tok/s"
                   + (f"（95%CI {fmt(s['prefill_ci95'][0], 0)}–{fmt(s['prefill_ci95'][1], 0)}）" if s.get("prefill_ci95") else "")
                   + f" (TTFT_any 全対回帰, R²={fmt(s.get('r2'), 3)}, {s.get('prefill_blocks', '-')}ブロック×{s.get('probe_reps', '-')}回) |",
+                  f"| Prefill（ロバスト） | {fmt(s.get('prefill_tps_robust'), 0)} tok/s (Theil-Sen 傾きの中央値) |",
+                  f"| TTFT ジッタ | p50 {fmt(s.get('ttft_p50_s'), 3)}s / p95 {fmt(s.get('ttft_p95_s'), 3)}s（p95/p50={fmt(s.get('ttft_jitter_p95_p50'), 2)}倍） |",
                   f"| 日本語トークン効率 | {fmt(s.get('tokens_per_char'), 3)} tok/文字（入力。1文字1トークン超は日本語の割高） |",
                   f"| Decode (client観測) | {fmt(s.get('decode_tps'), 1)} tok/s"
                   + (f" / 実効 {fmt(s.get('decode_chars_per_s'), 1)} 文字/s・本文のみ "
