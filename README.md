@@ -56,6 +56,8 @@ GPU・並列化・sampling・ネットワークを含む構成全体（**SUT**�
 
 ## 生データ
 
+`results/` に実測の生データを同梱している（`docs/RESULTS.md` の数値はここから再生成できる）。
+
 - `manifest_<SUT>.json`: SUT 識別子（量子化・engine 版・GPU・TP・speculative）、sampling、cache mode、dataset hash、grader version、protocol
 - `attempts.jsonl`: attempt 単位の `s/f_any/f_answer/l/e`、`N`、`C`、`usage`、`finish_reason`、`done_seen`、`parse_errors`、`state`、回答全文（`--no-full-text` で切詰め）
 - `results.json` / `report.md`: 集計（生データから再生成できる）
@@ -71,6 +73,8 @@ python3 bench.py --model X --sut-meta quantization=EXL3 --sut-meta engine=vllm \
 ## 使い方
 
 ```bash
+pip install -r requirements.txt
+
 # 1モデル、3回ずつ（probe も3回中央値）
 python3 bench.py --model gemma-4-26B-A4B-it --runs 3
 

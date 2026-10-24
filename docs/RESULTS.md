@@ -163,7 +163,11 @@ A の TTFT は同じ入力長でも 2.45s と 6.10s のように 2.5 倍の差�
 
 ## 生データ
 
+`results/` に同梱している run は次のとおり。
+
 - `results/spec-v3-blackfold/`（A: 18問×3、manifest、attempts.jsonl、report.md）
 - `results/spec-v3-glm/`（B: 18問×3）
 - `results/oss-glm/`（B: 旧版の参考）
 - `results/openrouter-1017/`, `results/openrouter-1017-prose/`（検証用）
+- `results/p1-prefill-a/`, `results/p1-prefill-b/`（P1 の8点 prefill）
+- `results/p1-variants-a/`, `results/p1-variants-b/`（P1 の題材違い入力）

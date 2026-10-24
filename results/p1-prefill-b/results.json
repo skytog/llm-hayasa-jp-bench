@@ -1,0 +1,483 @@
+[
+  {
+    "model": "GLM-5.3-Flash-Uncensored-TensorFold",
+    "speed": {
+      "prefill": {
+        "prefill_tps": 1883.0256579079723,
+        "prefill_ci95": [
+          1858.4,
+          1905.9
+        ],
+        "intercept_s": 0.39869083020081475,
+        "r2": 0.9908757834476234,
+        "samples": [
+          {
+            "chars": 500,
+            "n": 6,
+            "ttft_median": 0.709,
+            "prompt_tokens_median": 442.0,
+            "tokens_per_char": 0.884
+          },
+          {
+            "chars": 1000,
+            "n": 6,
+            "ttft_median": 0.8992,
+            "prompt_tokens_median": 831.0,
+            "tokens_per_char": 0.831
+          },
+          {
+            "chars": 1500,
+            "n": 6,
+            "ttft_median": 1.0228,
+            "prompt_tokens_median": 1215.0,
+            "tokens_per_char": 0.81
+          },
+          {
+            "chars": 2000,
+            "n": 6,
+            "ttft_median": 1.0806,
+            "prompt_tokens_median": 1602.5,
+            "tokens_per_char": 0.801
+          },
+          {
+            "chars": 3000,
+            "n": 6,
+            "ttft_median": 1.6855,
+            "prompt_tokens_median": 2375.5,
+            "tokens_per_char": 0.792
+          },
+          {
+            "chars": 4000,
+            "n": 6,
+            "ttft_median": 2.0612,
+            "prompt_tokens_median": 3145.5,
+            "tokens_per_char": 0.786
+          },
+          {
+            "chars": 6000,
+            "n": 6,
+            "ttft_median": 2.8723,
+            "prompt_tokens_median": 4689.5,
+            "tokens_per_char": 0.782
+          },
+          {
+            "chars": 8000,
+            "n": 6,
+            "ttft_median": 3.7049,
+            "prompt_tokens_median": 6239.5,
+            "tokens_per_char": 0.78
+          }
+        ],
+        "mean_tokens_per_char": 0.808,
+        "requested": 48,
+        "valid": 48,
+        "failed": 0,
+        "probe_reps": 2,
+        "blocks": 3,
+        "failed_lengths": [],
+        "ttft_answer_valid": 0,
+        "pairs": [
+          [
+            3144,
+            2.2359
+          ],
+          [
+            3144,
+            2.0691
+          ],
+          [
+            1214,
+            1.0203
+          ],
+          [
+            1213,
+            1.1259
+          ],
+          [
+            6240,
+            3.6844
+          ],
+          [
+            6235,
+            3.7123
+          ],
+          [
+            1599,
+            1.194
+          ],
+          [
+            1603,
+            1.0898
+          ],
+          [
+            2374,
+            1.6923
+          ],
+          [
+            2376,
+            1.8063
+          ],
+          [
+            443,
+            0.7219
+          ],
+          [
+            440,
+            0.7471
+          ],
+          [
+            829,
+            0.8937
+          ],
+          [
+            831,
+            0.9141
+          ],
+          [
+            4689,
+            3.0115
+          ],
+          [
+            4691,
+            2.859
+          ],
+          [
+            1216,
+            0.845
+          ],
+          [
+            1215,
+            1.0321
+          ],
+          [
+            3146,
+            2.0534
+          ],
+          [
+            3145,
+            1.9959
+          ],
+          [
+            4690,
+            2.883
+          ],
+          [
+            4688,
+            3.0665
+          ],
+          [
+            444,
+            0.6958
+          ],
+          [
+            441,
+            0.7961
+          ],
+          [
+            1599,
+            1.1982
+          ],
+          [
+            1605,
+            1.0714
+          ],
+          [
+            6242,
+            3.7284
+          ],
+          [
+            6236,
+            3.6975
+          ],
+          [
+            831,
+            0.9046
+          ],
+          [
+            829,
+            0.9927
+          ],
+          [
+            2375,
+            1.6788
+          ],
+          [
+            2373,
+            1.6739
+          ],
+          [
+            835,
+            0.7454
+          ],
+          [
+            834,
+            0.7303
+          ],
+          [
+            6240,
+            3.6633
+          ],
+          [
+            6239,
+            3.7373
+          ],
+          [
+            4690,
+            2.8617
+          ],
+          [
+            4687,
+            2.8534
+          ],
+          [
+            445,
+            0.6961
+          ],
+          [
+            440,
+            0.6924
+          ],
+          [
+            1602,
+            1.036
+          ],
+          [
+            1603,
+            1.0712
+          ],
+          [
+            3146,
+            1.9841
+          ],
+          [
+            3147,
+            2.0744
+          ],
+          [
+            2377,
+            1.6714
+          ],
+          [
+            2376,
+            1.7354
+          ],
+          [
+            1215,
+            1.0253
+          ],
+          [
+            1216,
+            0.9122
+          ]
+        ],
+        "note": "TTFT_any の全有効対による傾き。3ブロック×ランダム順。CI はブロック・ブートストラップ (n=2000)。切片はネットワーク+キュー待ち+固定費の合計で内訳ではない"
+      },
+      "decode": {
+        "style": "prose",
+        "R_out_tok_per_s": 80.9,
+        "chars_per_s": null,
+        "content_chars_per_s": null,
+        "chars_per_token": null,
+        "content_chars": 0.0,
+        "p50_inter_chunk_gap_ms": 11.28,
+        "p90_inter_chunk_gap_ms": 19.233,
+        "tokens_per_chunk": 1.01,
+        "ttft_any_s": 0.266,
+        "ttft_answer_s": null,
+        "completion_tokens": 4096.0,
+        "itl_samples": 4052.0,
+        "state": "ok",
+        "requested": 2,
+        "valid": 2,
+        "failed": 0,
+        "probe_reps": 2,
+        "runs": [
+          {
+            "state": "empty",
+            "valid": true,
+            "usage_available": true,
+            "R_out": 80.93613341000376,
+            "gap_p50_ms": 11.283757165074348,
+            "gap_p90_ms": 19.171313382685184,
+            "tokens_per_chunk": 1.01,
+            "ttft_any": 0.3790442692115903,
+            "ttft_answer": null,
+            "completion_tokens": 4096,
+            "content_chars": 0,
+            "chars_per_s": null,
+            "content_chars_per_s": null,
+            "chars_per_token": null,
+            "itl_samples": 4052
+          },
+          {
+            "state": "empty",
+            "valid": true,
+            "usage_available": true,
+            "R_out": 80.9348392409607,
+            "gap_p50_ms": 11.277159210294485,
+            "gap_p90_ms": 19.294172525405884,
+            "tokens_per_chunk": 1.01,
+            "ttft_any": 0.1539305103942752,
+            "ttft_answer": null,
+            "completion_tokens": 4096,
+            "content_chars": 0,
+            "chars_per_s": null,
+            "content_chars_per_s": null,
+            "chars_per_token": null,
+            "itl_samples": 4052
+          }
+        ]
+      },
+      "prefill_tps": 1883.0256579079723,
+      "prefill_ci95": [
+        1858.4,
+        1905.9
+      ],
+      "prefill_blocks": 3,
+      "intercept_s": 0.39869083020081475,
+      "r2": 0.9908757834476234,
+      "prefill_samples": [
+        {
+          "chars": 500,
+          "n": 6,
+          "ttft_median": 0.709,
+          "prompt_tokens_median": 442.0,
+          "tokens_per_char": 0.884
+        },
+        {
+          "chars": 1000,
+          "n": 6,
+          "ttft_median": 0.8992,
+          "prompt_tokens_median": 831.0,
+          "tokens_per_char": 0.831
+        },
+        {
+          "chars": 1500,
+          "n": 6,
+          "ttft_median": 1.0228,
+          "prompt_tokens_median": 1215.0,
+          "tokens_per_char": 0.81
+        },
+        {
+          "chars": 2000,
+          "n": 6,
+          "ttft_median": 1.0806,
+          "prompt_tokens_median": 1602.5,
+          "tokens_per_char": 0.801
+        },
+        {
+          "chars": 3000,
+          "n": 6,
+          "ttft_median": 1.6855,
+          "prompt_tokens_median": 2375.5,
+          "tokens_per_char": 0.792
+        },
+        {
+          "chars": 4000,
+          "n": 6,
+          "ttft_median": 2.0612,
+          "prompt_tokens_median": 3145.5,
+          "tokens_per_char": 0.786
+        },
+        {
+          "chars": 6000,
+          "n": 6,
+          "ttft_median": 2.8723,
+          "prompt_tokens_median": 4689.5,
+          "tokens_per_char": 0.782
+        },
+        {
+          "chars": 8000,
+          "n": 6,
+          "ttft_median": 3.7049,
+          "prompt_tokens_median": 6239.5,
+          "tokens_per_char": 0.78
+        }
+      ],
+      "tokens_per_char": 0.808,
+      "probe_reps": 2,
+      "decode_tps": 80.9,
+      "decode_style": "prose",
+      "decode_chars_per_s": null,
+      "decode_content_chars_per_s": null,
+      "decode_chars_per_token": null,
+      "p50_itl_ms": 11.28,
+      "p90_itl_ms": 19.233,
+      "tokens_per_chunk": 1.01,
+      "cold_start_ttft_s": 4.72
+    },
+    "tasks": [
+      {
+        "task": "numeric_multi_step",
+        "run": 0,
+        "passed": true,
+        "state": "pass",
+        "detail": "ok",
+        "elapsed": 4.54,
+        "ttft_any": 0.435,
+        "ttft_answer": 2.993,
+        "prompt_tokens": 117,
+        "completion_tokens": 342,
+        "finish_reason": "stop",
+        "reasoning_chars": 425,
+        "content_chars": 258,
+        "reasoning_repeat_ratio": null,
+        "chars_per_s": 56.84,
+        "content_chars_per_s": 166.93,
+        "l": 4.539,
+        "done_seen": true,
+        "parse_errors": 0,
+        "usage_available": true,
+        "degraded": false,
+        "usage": {
+          "prompt_tokens": 117,
+          "completion_tokens": 342,
+          "total_tokens": 459,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 159
+          }
+        },
+        "reasoning_head": "Let me solve this problem.\n\nAさん's monthly take-home pay: 280,000 yen\nSavings rate from monthly salary: 35%\n\nMonthly savings: 280,000 × 0.35 = 98,000 yen\nAnnual savings from monthly salary: 98,000 × 12 = 1,176,000 yen\n\nBonus: 2.5 months of take-home pay\nBonus amount: 280,000 × 2.5 = 700,000 yen\nSavings from bonus: 700,000 × 0.60 = 420,000 yen\n\nTotal annual savings: 1,176,000 + 420,000 = 1,596,000 yen\n\nAnswer: 1,596,000 yen",
+        "reasoning_tail": "Let me solve this problem.\n\nAさん's monthly take-home pay: 280,000 yen\nSavings rate from monthly salary: 35%\n\nMonthly savings: 280,000 × 0.35 = 98,000 yen\nAnnual savings from monthly salary: 98,000 × 12 = 1,176,000 yen\n\nBonus: 2.5 months of take-home pay\nBonus amount: 280,000 × 2.5 = 700,000 yen\nSavings from bonus: 700,000 × 0.60 = 420,000 yen\n\nTotal annual savings: 1,176,000 + 420,000 = 1,596,000 yen\n\nAnswer: 1,596,000 yen",
+        "reasoning": "Let me solve this problem.\n\nAさん's monthly take-home pay: 280,000 yen\nSavings rate from monthly salary: 35%\n\nMonthly savings: 280,000 × 0.35 = 98,000 yen\nAnnual savings from monthly salary: 98,000 × 12 = 1,176,000 yen\n\nBonus: 2.5 months of take-home pay\nBonus amount: 280,000 × 2.5 = 700,000 yen\nSavings from bonus: 700,000 × 0.60 = 420,000 yen\n\nTotal annual savings: 1,176,000 + 420,000 = 1,596,000 yen\n\nAnswer: 1,596,000 yen",
+        "output": "## 計算過程\n\n**① 毎月の給与からの貯金**\n\n- 毎月の貯金額：280,000円 × 35% = 98,000円\n- 年間の貯金額：98,000円 × 12か月 = 1,176,000円\n\n**② ボーナスからの貯金**\n\n- ボーナス額：280,000円 × 2.5か月分 = 700,000円\n- ボーナスからの貯金額：700,000円 × 60% = 420,000円\n\n**③ 1年間の貯金総額**\n\n- 1,176,000円 + 420,000円 = 1,596,000円\n\n答え： 1596000"
+      }
+    ],
+    "per_task": [
+      {
+        "task": "numeric_multi_step",
+        "pass": "1/1",
+        "rate": 1.0,
+        "mean_time_s": 4.54
+      }
+    ],
+    "summary": {
+      "task_runs": 1,
+      "task_passes": 1,
+      "success_rate": 1.0,
+      "success_rate_ci95": [
+        0.2065,
+        1.0
+      ],
+      "task_pass_rate": 1.0,
+      "task_pass_ci95": [
+        0.2065,
+        1.0
+      ],
+      "quality_rate": 1.0,
+      "grader_errors": 0,
+      "degraded": false,
+      "mean_task_time_s": 4.54,
+      "time_to_pass_s": 4.54,
+      "mean_reasoning_repeat": null,
+      "mean_chars_per_s": 56.84,
+      "mean_content_chars_per_s": 166.93,
+      "states": {
+        "pass": 1
+      }
+    }
+  }
+]

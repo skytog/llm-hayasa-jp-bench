@@ -1,0 +1,57 @@
+{
+  "schema_version": "0.1",
+  "run_id": "p1-prefill-a",
+  "created_at": "2026-10-24T22:08:57+09:00",
+  "sut": {
+    "name": "DeepSeek-V4.1-Flash-1017-BLACKFOLD-TP2",
+    "model_revision": null,
+    "quantization": "EXL3",
+    "tokenizer_hash": null,
+    "chat_template_hash": null,
+    "engine": {
+      "name": "unknown",
+      "version": "unknown",
+      "args": []
+    },
+    "gpu": {
+      "type": "GB10",
+      "count": 2,
+      "driver": null
+    },
+    "parallelism": {
+      "tp": 2
+    },
+    "speculative": null,
+    "sampling": {
+      "temperature": 0.0,
+      "top_p": null,
+      "seed": null
+    },
+    "cache": {
+      "mode": "unknown"
+    },
+    "context_limit": null
+  },
+  "endpoint": {
+    "base_url": "https://127.0.0.1:8000",
+    "client_version": "6084922",
+    "network": "tailscale"
+  },
+  "protocol": {
+    "scenario": "S1",
+    "repetitions": 1,
+    "timeout_s": 900,
+    "retry": "off",
+    "max_tokens_policy": "per-task (tasks.py)",
+    "seed": null
+  },
+  "dataset": {
+    "name": "ja_smoke_v1",
+    "hash": "b111294e16f05eabd6f16e26132f0c7c8d85bb7773a68eca0219d70d0d62589e",
+    "task_count": 1
+  },
+  "grader": {
+    "version": "6084922",
+    "contract": "strict_v1"
+  }
+}
